@@ -59,6 +59,8 @@
 
 #ifdef __ANDROID__
 REXCVAR_DECLARE(int32_t, mcla_fps);  // Defined in frame_timing.cpp.
+REXCVAR_DEFINE_BOOL(mcla_adreno_610_compatibility, false, "MCLA",
+                    "Use the conservative Vulkan texture and render pass paths on Adreno 610");
 REXCVAR_DEFINE_BOOL(mcla_fps_overlay, true, "MCLA",
                     "Show game-update FPS and frame time");
 REXCVAR_DEFINE_BOOL(mcla_fps_log, true, "MCLA",
@@ -869,6 +871,15 @@ void MclaApp::OnPreSetup(rex::RuntimeConfig& config) {
   MclaApplyPreset();
 #if REX_PLATFORM_ANDROID
   MclaApplyAndroidPerformanceProfile();
+  if (REXCVAR_GET(mcla_adreno_610_compatibility)) {
+    rex::cvar::SetDefaultValue("texture_load_direct_unscaled", "false");
+    rex::cvar::SetDefaultValue("vulkan_dynamic_rendering", "false");
+    rex::cvar::SetDefaultValue("mcla_aspect_ratio", "16:9");
+    REXLOG_INFO("Adreno 610 compatibility: direct texture loads={}, dynamic rendering={}, aspect={}",
+                rex::cvar::GetFlagByName("texture_load_direct_unscaled"),
+                rex::cvar::GetFlagByName("vulkan_dynamic_rendering"),
+                rex::cvar::GetFlagByName("mcla_aspect_ratio"));
+  }
 #endif
 #ifdef _WIN32
   // The GPU the game chose (ChooseGpu) is the one the SDK takes, whatever the API: d3d12_adapter

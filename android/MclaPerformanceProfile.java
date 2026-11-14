@@ -27,8 +27,11 @@ final class MclaPerformanceProfile {
         }
         int choice = selected(context);
         if (choice != 0) return VALUES[choice];
-        return Build.VERSION.SDK_INT >= 31 && "SM6225".equalsIgnoreCase(Build.SOC_MODEL)
-                ? "performance" : "standard";
+        return isSnapdragon680() ? "performance" : "standard";
+    }
+
+    static boolean isSnapdragon680() {
+        return Build.VERSION.SDK_INT >= 31 && "SM6225".equalsIgnoreCase(Build.SOC_MODEL);
     }
 
     static String defaultTurnipDebug(Context context) {

@@ -171,6 +171,8 @@ public final class MclaActivity extends SDLActivity {
         String profile = MclaPerformanceProfile.resolve(this);
         try {
             Os.setenv("REX_MCLA_ANDROID_PERFORMANCE", profile, true);
+            Os.setenv("REX_MCLA_ADRENO_610_COMPATIBILITY",
+                    MclaPerformanceProfile.isSnapdragon680() ? "true" : "false", true);
             Log.i(TAG, "Graphics performance profile: " + profile);
         } catch (Exception e) {
             Log.e(TAG, "Could not apply graphics performance profile", e);

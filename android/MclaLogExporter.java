@@ -1,5 +1,8 @@
 package org.mcla.recomp;
 
+import android.app.ActivityManager;
+import android.app.ApplicationExitInfo;
+
 import android.content.ContentResolver;
 import android.content.ContentValues;
 import android.content.Context;
@@ -34,6 +37,7 @@ final class MclaLogExporter {
         }
         synchronized (LOCK) {
             File source = new File(context.getFilesDir(), "logs");
+            if (android.os.Build.VERSION.SDK_INT >= 30) exportCrashReason(context);
             File[] logs = source.listFiles((dir, name) -> name.startsWith("mcla_") &&
                     name.endsWith(".log"));
             if (logs == null) return;
@@ -72,6 +76,42 @@ final class MclaLogExporter {
                     Log.e(TAG, "Could not export " + name + " to " + RELATIVE_PATH, e);
                 }
             }
+        }
+    }
+
+    private static void exportCrashReason(Context context) {
+        if (android.os.Build.VERSION.SDK_INT < 30) return;
+        try {
+            ActivityManager manager = context.getSystemService(ActivityManager.class);
+            if (manager == null) return;
+            for (ApplicationExitInfo exit : manager.getHistoricalProcessExitReasons(null, 0, 8)) {
+                int reason = exit.getReason();
+                if (reason != ApplicationExitInfo.REASON_CRASH_NATIVE &&
+                        reason != ApplicationExitInfo.REASON_CRASH &&
+                        reason != ApplicationExitInfo.REASON_SIGNALED &&
+                        reason != ApplicationExitInfo.REASON_LOW_MEMORY) continue;
+                SharedPreferences state =
+                        context.getSharedPreferences("exported-logs", Context.MODE_PRIVATE);
+                if (state.getLong("last-exit", 0) >= exit.getTimestamp()) return;
+                File report = File.createTempFile("mcla-exit-", ".tmp", context.getCacheDir());
+                try {
+                    try (java.io.FileOutputStream output = new java.io.FileOutputStream(report)) {
+                        String summary = "Android exit reason: " + reason + ", status: "
+                                + exit.getStatus() + ", pid: " + exit.getPid() + ", time: "
+                                + new java.util.Date(exit.getTimestamp()) + "\n"
+                                + exit.getDescription() + "\n";
+                        output.write(summary.getBytes(java.nio.charset.StandardCharsets.UTF_8));
+                    }
+                    exportOne(context.getContentResolver(), state, "mcla-android-exit.log",
+                            new File[]{report});
+                    state.edit().putLong("last-exit", exit.getTimestamp()).apply();
+                } finally {
+                    report.delete();
+                }
+                return;
+            }
+        } catch (Exception error) {
+            Log.w(TAG, "Could not export the Android process exit reason", error);
         }
     }
 

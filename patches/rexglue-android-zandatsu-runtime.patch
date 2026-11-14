@@ -223,7 +223,7 @@ index 4918661..a80f3cd 100644
      if (with_gpu_emulation) {
        XE_UI_VULKAN_FEATURE_2(features_KHR_portability_subset, constantAlphaColorBlendFactors)
 diff --git a/src/ui/vulkan/vulkan_instance.cpp b/src/ui/vulkan/vulkan_instance.cpp
-index 13f3743..59cf39e 100644
+index 13f3743..8827665 100644
 --- a/src/ui/vulkan/vulkan_instance.cpp
 +++ b/src/ui/vulkan/vulkan_instance.cpp
 @@ -10,6 +10,7 @@
@@ -311,6 +311,49 @@ index 13f3743..59cf39e 100644
      vulkan_instance->loader_.Adopt(custom_loader);
      loader_loaded = true;
    } else {
+@@ -447,7 +463,8 @@ std::unique_ptr<VulkanInstance> VulkanInstance::Create(const bool with_surface,
+   // "Vulkan 1.0 implementations were required to return
+   // VK_ERROR_INCOMPATIBLE_DRIVER if apiVersion was larger than 1.0."
+   application_info.apiVersion = vulkan_instance->api_version_ >= VK_MAKE_API_VERSION(0, 1, 1, 0)
+-                                    ? VulkanDevice::kHighestUsedApiMinorVersion
++                                    ? std::min(vulkan_instance->api_version_,
++                                               VulkanDevice::kHighestUsedApiMinorVersion)
+                                     : VK_MAKE_API_VERSION(0, 1, 0, 0);
+ 
+   VkInstanceCreateInfo instance_create_info;
+@@ -498,10 +515,12 @@ std::unique_ptr<VulkanInstance> VulkanInstance::Create(const bool with_surface,
+ 
+   // Load instance functions.
+ 
+-#define XE_UI_VULKAN_FUNCTION(name)                                                            \
+-  functions_loaded &=                                                                          \
+-      (ifn.name = PFN_##name(ifn.vkGetInstanceProcAddr(vulkan_instance->instance_, #name))) != \
+-      nullptr;
++#define XE_UI_VULKAN_FUNCTION(name)                                                   \
++  ifn.name = PFN_##name(ifn.vkGetInstanceProcAddr(vulkan_instance->instance_, #name)); \
++  if (!ifn.name) {                                                                     \
++    REXLOG_ERROR("Missing Vulkan instance function: {}", #name);                       \
++    functions_loaded = false;                                                          \
++  }
+ 
+   // Vulkan 1.0.
+ #include <rex/ui/vulkan/functions/instance_1_0.inc>
+@@ -554,7 +573,15 @@ std::unique_ptr<VulkanInstance> VulkanInstance::Create(const bool with_surface,
+ #include <rex/ui/vulkan/functions/instance_khr_surface.inc>
+   }
+   if (vulkan_instance->extensions_.ext_EXT_debug_utils) {
++#undef XE_UI_VULKAN_FUNCTION
++#define XE_UI_VULKAN_FUNCTION(name) \
++    ifn.name = PFN_##name(ifn.vkGetInstanceProcAddr(vulkan_instance->instance_, #name));
+ #include <rex/ui/vulkan/functions/instance_ext_debug_utils.inc>
++    if (!ifn.vkCreateDebugUtilsMessengerEXT || !ifn.vkDestroyDebugUtilsMessengerEXT ||
++        !ifn.vkSetDebugUtilsObjectNameEXT) {
++      vulkan_instance->extensions_.ext_EXT_debug_utils = false;
++      REXLOG_WARN("Vulkan debug utilities unavailable; continuing without them");
++    }
+   }
+ #undef XE_UI_VULKAN_FUNCTION_PROMOTED
+ 
 diff --git a/src/ui/vulkan/vulkan_provider.cpp b/src/ui/vulkan/vulkan_provider.cpp
 index 9eeb902..a7edd0e 100644
 --- a/src/ui/vulkan/vulkan_provider.cpp
