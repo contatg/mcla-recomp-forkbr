@@ -42,13 +42,6 @@ public final class MclaLauncherActivity extends Activity {
     private static final long MAX_DRIVER_BYTES = 128L * 1024 * 1024;
     private static final long MAX_SHADER_PACK_BYTES = 64L * 1024 * 1024;
     private static final String SHADER_PACK_NAME = "545407F8.shaderpack";
-    private static final String[] REQUIRED = {
-        "default.xex", "xarchive_audio.rpf", "xarchive_audlo.rpf",
-        "xarchive_cache.rpf", "xarchive_music.rpf",
-        "attract576_16x9.bik", "attract576_4x3.bik", "attract720.bik",
-        "intro576_16x9.bik", "intro576_4x3.bik", "intro720.bik",
-        "nxeart", "root_directory_padding.pad"
-    };
 
     private final Handler mainHandler = new Handler(Looper.getMainLooper());
     private TextView status;
@@ -381,16 +374,11 @@ public final class MclaLauncherActivity extends Activity {
     }
 
     private boolean hasGameFiles() {
-        File folder = new File(getFilesDir(), "game");
-        for (String name : REQUIRED) {
-            File file = new File(folder, name);
-            if (!file.isFile() || file.length() == 0) return false;
-        }
-        return true;
+        return MclaGameImport.isReady(new File(getFilesDir(), "game"));
     }
 
     private void startGame() {
-        if (playPending) return;
+        if (playPending || !hasGameFiles()) return;
         playPending = true;
         playButton.setEnabled(false);
         setRequestedOrientation(ActivityInfo.SCREEN_ORIENTATION_LANDSCAPE);
@@ -449,8 +437,9 @@ public final class MclaLauncherActivity extends Activity {
         }
         getWindow().addFlags(WindowManager.LayoutParams.FLAG_KEEP_SCREEN_ON);
         pickButton.setEnabled(false);
+        playButton.setEnabled(false);
         progress.setIndeterminate(false);
-        progress.setMax(REQUIRED.length);
+        progress.setMax(MclaGameImport.REQUIRED.length);
         progress.setProgress(0);
         progress.setVisibility(View.VISIBLE);
         status.setText("Checking game files...");
@@ -483,53 +472,21 @@ public final class MclaLauncherActivity extends Activity {
         try {
             String rootId = DocumentsContract.getTreeDocumentId(tree);
             Map<String, Uri> files = children(tree, rootId);
-            for (String name : REQUIRED) {
+            for (String name : MclaGameImport.REQUIRED) {
                 if (!files.containsKey(name)) throw new Exception("Missing file: " + name);
             }
-            if (!folder.isDirectory() && !folder.mkdirs())
-                throw new Exception("Could not create the private game folder.");
-
-            byte[] buffer = new byte[1024 * 1024];
-            for (int index = 0; index < REQUIRED.length; index++) {
-                String name = REQUIRED[index];
-                final int fileNumber = index + 1;
-                mainHandler.post(() -> status.setText("Copying " + name + " ("
-                        + fileNumber + "/" + REQUIRED.length + ")..."));
-                File target = new File(folder, name);
-                File part = new File(folder, name + ".partial");
-                try {
-                    try (InputStream input = getContentResolver().openInputStream(files.get(name));
-                         FileOutputStream output = new FileOutputStream(part)) {
-                        if (input == null) throw new Exception("Could not open " + name);
-                        int count;
-                        long copied = 0;
-                        long nextReport = 64L * 1024 * 1024;
-                        while ((count = input.read(buffer)) != -1) {
-                            output.write(buffer, 0, count);
-                            copied += count;
-                            if (copied >= nextReport) {
-                                final long copiedMiB = copied / (1024 * 1024);
-                                mainHandler.post(() -> status.setText("Copying " + name + " ("
-                                        + fileNumber + "/" + REQUIRED.length + ", "
-                                        + copiedMiB + " MiB)..."));
-                                nextReport += 64L * 1024 * 1024;
-                            }
-                        }
-                        output.getFD().sync();
-                    }
-                    if (!part.renameTo(target))
-                        throw new Exception("Could not save " + name);
-                } catch (Exception e) {
-                    part.delete();
-                    throw e;
-                }
-                mainHandler.post(() -> progress.setProgress(fileNumber));
-            }
-            if (!hasGameFiles()) throw new Exception("The copy finished with incomplete files.");
+            MclaGameImport.copy(folder, name -> getContentResolver().openInputStream(files.get(name)),
+                    (completed, name, copiedMiB) -> mainHandler.post(() -> {
+                        progress.setProgress(completed);
+                        String size = copiedMiB == 0 ? "" : ", " + copiedMiB + " MiB";
+                        status.setText("Copying " + name + " (" + (completed + 1) + "/"
+                                + MclaGameImport.REQUIRED.length + size + ")...");
+                    }));
             mainHandler.post(() -> {
                 getWindow().clearFlags(WindowManager.LayoutParams.FLAG_KEEP_SCREEN_ON);
+                progress.setVisibility(View.GONE);
                 pickButton.setVisibility(View.GONE);
-                playButton.setEnabled(true);
+                playButton.setEnabled(driverButton.isEnabled());
                 status.setText("Game files ready. Tap Play.");
             });
         } catch (SecurityException e) {
