@@ -172,6 +172,11 @@ public final class MclaActivity extends SDLActivity {
         }
         try {
             Os.setenv("REX_LOG_FILE", new File(directory, "mcla.log").getAbsolutePath(), true);
+            Os.setenv("MCLA_ANDROID_VERSION",
+                    getPackageManager().getPackageInfo(getPackageName(), 0).versionName, true);
+            Os.setenv("REX_MCLA_HOST_CALL_TRACE",
+                    getSharedPreferences("runtime_diagnostics", MODE_PRIVATE)
+                        .getBoolean("host_calls", false) ? "true" : "false", true);
             Os.setenv("REX_LOG_MAX_FILES", "1", true);
             Os.setenv("REX_LOG_MAX_FILE_SIZE_MB", "10", true);
         } catch (Exception e) {

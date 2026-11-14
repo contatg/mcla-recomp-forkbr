@@ -1,0 +1,234 @@
+diff --git a/include/rex/android_diagnostics.h b/include/rex/android_diagnostics.h
+index d92a305..a7108d2 100644
+--- a/include/rex/android_diagnostics.h
++++ b/include/rex/android_diagnostics.h
+@@ -28,6 +28,30 @@ struct AndroidDiagnostics {
+ 
+ AndroidDiagnostics& GetAndroidDiagnostics();
+ int AndroidDiagnosticTid();
++extern std::atomic<bool> android_trace_host_calls;
++extern thread_local uint32_t android_guest_caller;
++void RecordAndroidHostCall(const char* name, uint64_t ns);
++void LogAndroidHostCalls();
++
++inline uint64_t AndroidDiagnosticNow();
++
++class AndroidHostCallScope {
++ public:
++  AndroidHostCallScope(const char* name, uint32_t lr)
++      : name_(name), caller_(android_guest_caller),
++        start_(android_trace_host_calls.load(std::memory_order_relaxed) ? AndroidDiagnosticNow() : 0) {
++    android_guest_caller = lr >= 4 ? lr - 4 : 0;
++  }
++  ~AndroidHostCallScope() {
++    android_guest_caller = caller_;
++    if (start_) RecordAndroidHostCall(name_, AndroidDiagnosticNow() - start_);
++  }
++
++ private:
++  const char* name_;
++  uint32_t caller_;
++  uint64_t start_;
++};
+ 
+ inline uint64_t AndroidDiagnosticNow() {
+   return std::chrono::duration_cast<std::chrono::nanoseconds>(
+diff --git a/include/rex/hook.h b/include/rex/hook.h
+index 4ce4f9b..1d93a5f 100644
+--- a/include/rex/hook.h
++++ b/include/rex/hook.h
+@@ -17,6 +17,7 @@
+ 
+ #include <fmt/format.h>
+ 
++#include <rex/android_diagnostics.h>
+ #include <rex/logging.h>
+ #include <rex/ppc/context.h>
+ #include <rex/ppc/function.h>
+@@ -69,10 +70,20 @@
+   }
+ 
+ // Export: hook + register in global registry for kernel ordinal lookup.
++#if REX_PLATFORM_ANDROID
++#define REX_EXPORT(name, function)                                            \
++  extern "C" REX_FUNC(name) {                                                  \
++    rex::AndroidHostCallScope scope(#name, static_cast<uint32_t>(ctx.lr));      \
++    rex::ppc::HostToGuestFunction<function>(ctx, base);                         \
++  }                                                                            \
++  static rex::ppc::detail::PPCFuncRegistrar _ppc_reg_##name(#name, &name);
++#else
+ #define REX_EXPORT(name, function) \
+   REX_HOOK(name, function)         \
+   static rex::ppc::detail::PPCFuncRegistrar _ppc_reg_##name(#name, &name);
+ 
++#endif
++
+ #define REX_EXPORT_STUB(name) \
+   REX_STUB(name)              \
+   static rex::ppc::detail::PPCFuncRegistrar _ppc_reg_##name(#name, &name);
+diff --git a/include/rex/thread.h b/include/rex/thread.h
+index 30b207d..a4f458b 100644
+--- a/include/rex/thread.h
++++ b/include/rex/thread.h
+@@ -304,6 +304,10 @@ class Semaphore : public WaitHandle {
+   // Returns false if adding release_count would set the semaphore over the
+   // initially specified maximum_count.
+   virtual bool Release(int release_count, int* out_previous_count) = 0;
++#if REX_PLATFORM_ANDROID
++  virtual bool ReleaseWithSignalTrace(int count, int* previous_count,
++                                     void (*trace)(void*), void* context) = 0;
++#endif
+ };
+ 
+ // Models a Win32-like mutant (mutex) object.
+diff --git a/src/core/logging.cpp b/src/core/logging.cpp
+index afc39c4..38c002f 100644
+--- a/src/core/logging.cpp
++++ b/src/core/logging.cpp
+@@ -59,6 +59,8 @@ REXCVAR_DEFINE_INT32(log_max_files, 20, "Log", "Max number of rotated log files
+ 
+ #if REX_PLATFORM_ANDROID
+ #include <unistd.h>
++#include <map>
++#include <tuple>
+ #endif
+ 
+ namespace rex {
+@@ -71,6 +73,51 @@ int AndroidDiagnosticTid() {
+   thread_local const int tid = gettid();
+   return tid;
+ }
++
++std::atomic<bool> android_trace_host_calls{false};
++thread_local uint32_t android_guest_caller = 0;
++
++namespace {
++struct HostCallTotals {
++  uint64_t calls = 0;
++  uint64_t ns = 0;
++};
++std::mutex host_calls_mutex;
++using HostCallKey = std::pair<int, const char*>;
++std::map<HostCallKey, HostCallTotals> host_calls;
++}
++
++void RecordAndroidHostCall(const char* name, uint64_t ns) {
++  std::lock_guard lock(host_calls_mutex);
++  auto& totals = host_calls[{AndroidDiagnosticTid(), name}];
++  ++totals.calls;
++  totals.ns += ns;
++}
++
++void LogAndroidHostCalls() {
++  std::map<HostCallKey, HostCallTotals> interval;
++  {
++    std::lock_guard lock(host_calls_mutex);
++    interval.swap(host_calls);
++  }
++  std::vector<std::pair<HostCallKey, HostCallTotals>> top(interval.begin(), interval.end());
++  std::sort(top.begin(), top.end(), [](const auto& a, const auto& b) {
++    if (a.first.first != b.first.first) return a.first.first < b.first.first;
++    return a.second.ns > b.second.ns;
++  });
++  int last_tid = 0;
++  unsigned rank = 0;
++  for (const auto& [key, totals] : top) {
++    const auto [tid, fn] = key;
++    if (tid != last_tid) {
++      last_tid = tid;
++      rank = 0;
++    }
++    if (++rank > 10) continue;
++    REXLOG_INFO("[hostcall] tid={} fn={} calls={} ms={:.3f}", tid, fn, totals.calls,
++                double(totals.ns) / 1e6);
++  }
++}
+ #endif
+ 
+ namespace {
+diff --git a/src/core/threading_posix.cpp b/src/core/threading_posix.cpp
+index 35cdf79..590eaca 100644
+--- a/src/core/threading_posix.cpp
++++ b/src/core/threading_posix.cpp
+@@ -491,7 +491,8 @@ class PosixCondition<Semaphore> : public PosixConditionBase {
+ 
+   bool Signal() override { return Release(1, nullptr); }
+ 
+-  bool Release(uint32_t release_count, int* out_previous_count) {
++  bool Release(uint32_t release_count, int* out_previous_count,
++               void (*trace)(void*) = nullptr, void* context = nullptr) {
+     auto lock = std::unique_lock<std::mutex>(mutex_);
+     if (release_count > maximum_count_ - count_) {
+       return false;
+@@ -499,6 +500,7 @@ class PosixCondition<Semaphore> : public PosixConditionBase {
+     if (out_previous_count) {
+       *out_previous_count = count_;
+     }
++    if (trace && release_count) trace(context);
+     count_ += release_count;
+     if (release_count && waiting_count_) {
+       if (release_count >= waiting_count_) {
+@@ -1415,6 +1417,12 @@ class PosixSemaphore : public PosixConditionHandle<Semaphore> {
+     }
+     return handle_.Release(static_cast<uint32_t>(release_count), out_previous_count);
+   }
++#if REX_PLATFORM_ANDROID
++  bool ReleaseWithSignalTrace(int count, int* previous_count,
++                              void (*trace)(void*), void* context) override {
++    return count > 0 && handle_.Release(uint32_t(count), previous_count, trace, context);
++  }
++#endif
+ };
+ 
+ std::unique_ptr<Semaphore> Semaphore::Create(int initial_count, int maximum_count) {
+diff --git a/src/system/xobject.cpp b/src/system/xobject.cpp
+index eb5970e..8bc59d0 100644
+--- a/src/system/xobject.cpp
++++ b/src/system/xobject.cpp
+@@ -207,8 +207,9 @@ uint32_t XObject::TimeoutTicksToMs(int64_t timeout_ticks) {
+ void XObject::RecordDiagnosticSignal() {
+   if (!rex::GetAndroidDiagnostics().trace_guest_waits.load(std::memory_order_relaxed)) return;
+   static std::atomic<uint32_t> sequence{0};
+-  diagnostic_signal_.store((uint64_t(sequence.fetch_add(1, std::memory_order_relaxed) + 1) << 32) |
+-                           uint32_t(rex::AndroidDiagnosticTid()));
++  const auto serial = sequence.fetch_add(1, std::memory_order_relaxed) & 0x3FFu;
++  diagnostic_signal_.store((uint64_t(rex::android_guest_caller) << 32) |
++                           (uint64_t(serial) << 22) | uint32_t(rex::AndroidDiagnosticTid()));
+ }
+ 
+ namespace {
+@@ -238,12 +239,13 @@ class GuestObjectWaitTrace {
+     for (size_t i = success && !all ? index : 0; i < end; ++i) {
+       const auto& object = *objects_[i];
+       const auto signal = object.diagnostic_signal();
+-      const auto signaler = success && signals_[i] != signal ? uint32_t(signal) : 0;
++      const auto signaler = success && signals_[i] != signal ? uint32_t(signal) & 0x3FFFFFu : 0;
++      const auto signaler_pc = signaler ? uint32_t(signal >> 32) : 0;
+       REXLOG_INFO("[guestwait2] obj=0x{:08X} type={} waiter={} signaler={} ms={:.3f} "
+-                  "result={} index={}/{} address_kind={}",
++                  "result={} index={}/{} address_kind={} signaler_pc=0x{:08X}",
+                   Address(object), unsigned(object.type()), rex::AndroidDiagnosticTid(), signaler,
+                   double(duration) / 1e6, unsigned(result), i, count_,
+-                  object.guest_object() ? "guest" : "handle");
++                  object.guest_object() ? "guest" : "handle", signaler_pc);
+     }
+   }
+ 
+diff --git a/src/system/xsemaphore.cpp b/src/system/xsemaphore.cpp
+index db830e4..f2f75c1 100644
+--- a/src/system/xsemaphore.cpp
++++ b/src/system/xsemaphore.cpp
+@@ -40,7 +40,13 @@ bool XSemaphore::InitializeNative(void* native_ptr, X_DISPATCH_HEADER* header) {
+ 
+ bool XSemaphore::ReleaseSemaphore(int32_t release_count, int32_t* out_previous_count) {
+   int32_t previous_count = 0;
++#if REX_PLATFORM_ANDROID
++  bool success = semaphore_->ReleaseWithSignalTrace(
++      release_count, &previous_count,
++      [](void* object) { static_cast<XSemaphore*>(object)->RecordDiagnosticSignal(); }, this);
++#else
+   bool success = semaphore_->Release(release_count, &previous_count);
++#endif
+   if (out_previous_count) {
+     *out_previous_count = previous_count;
+   }

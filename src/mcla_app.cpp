@@ -70,6 +70,7 @@
 
 #ifdef __ANDROID__
 REXCVAR_DECLARE(int32_t, mcla_fps);  // Defined in frame_timing.cpp.
+REXCVAR_DEFINE_BOOL(mcla_host_call_trace, false, "MCLA", "Trace timed Xbox kernel imports on Android");
 REXCVAR_DEFINE_BOOL(mcla_city_diagnostics, true, "MCLA",
                     "Sample guest worker PCs and long guest synchronization waits on Android");
 REXCVAR_DEFINE_BOOL(mcla_adreno_610_compatibility, false, "MCLA",
@@ -1369,7 +1370,13 @@ void SampleAndroidRuntime(std::stop_token stop) {
   std::jthread hot_guest_thread;
   if (data.trace_guest_waits.load()) hot_guest_thread = std::jthread(SampleHotGuest);
   uint64_t previous_updates = 0;
-  auto memory_deadline = start + seconds(5);
+  auto memory_deadline = start;
+  const auto report_build = [&] {
+    const char* version = std::getenv("MCLA_ANDROID_VERSION");
+    REXLOG_INFO("[build] version={} commit={} host_calls={} city_diagnostics={}",
+                version ? version : "unknown", MCLA_BUILD_COMMIT,
+                rex::android_trace_host_calls.load(), data.trace_guest_waits.load());
+  };
   const long ticks_per_sec = sysconf(_SC_CLK_TCK);
   uint64_t previous_bytes = 0, previous_reads = 0, previous_read_ns = 0;
   constexpr auto wait_count = unsigned(rex::AndroidWait::kCount);
@@ -1385,6 +1392,7 @@ void SampleAndroidRuntime(std::stop_token stop) {
     const double seconds_elapsed = duration<double>(now - last).count();
     last = now;
 
+    report_build();
     REXLOG_INFO("[stage] t={}s guest_frames={} presented={} pipelines_pending={} "
                 "pipelines_created={} last_vk_wait={} guest_updates={}",
                 duration_cast<seconds>(now - start).count(), data.frames.load(),
@@ -1472,6 +1480,7 @@ void SampleAndroidRuntime(std::stop_token stop) {
                   double(stamp - waiting_since) / 1e6);
     }
     if (now >= memory_deadline) {
+      if (rex::android_trace_host_calls.load()) rex::LogAndroidHostCalls();
       std::ifstream status("/proc/self/status");
       std::string line;
       long rss_kib = -1;
@@ -1491,6 +1500,7 @@ void SampleAndroidRuntime(std::stop_token stop) {
 void MclaApp::OnPostSetup() {
 #if REX_PLATFORM_ANDROID
   rex::GetAndroidDiagnostics().trace_guest_waits.store(REXCVAR_GET(mcla_city_diagnostics));
+  rex::android_trace_host_calls.store(REXCVAR_GET(mcla_host_call_trace));
   diagnostics_thread_ = std::jthread(SampleAndroidRuntime);
 #endif
   ConfigureFrameTiming();

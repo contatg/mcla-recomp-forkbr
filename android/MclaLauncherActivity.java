@@ -251,6 +251,15 @@ public final class MclaLauncherActivity extends Activity {
 
         LinearLayout extrasCard = card(layout, "03  Extras", "Optional graphics assets and touch layout.");
 
+        android.widget.Switch hostTrace = new android.widget.Switch(this);
+        hostTrace.setText("Rastrear chamadas do host (próximo Play)");
+        android.content.SharedPreferences diagnostics =
+                getSharedPreferences("runtime_diagnostics", MODE_PRIVATE);
+        hostTrace.setChecked(diagnostics.getBoolean("host_calls", false));
+        hostTrace.setOnCheckedChangeListener((view, enabled) ->
+                diagnostics.edit().putBoolean("host_calls", enabled).apply());
+        extrasCard.addView(hostTrace);
+
         shaderStatus = new TextView(this);
         shaderStatus.setTextColor(0xFFA8B9C4);
         extrasCard.addView(shaderStatus);

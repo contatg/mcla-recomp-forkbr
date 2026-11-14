@@ -363,3 +363,27 @@ Exporte em **Extras → Exportar diagnóstico** logo depois de cada teste,
 salve as duas cópias com nomes diferentes e informe se houve imagem verde,
 áudio e corrida. Inclua as linhas `[stage]`, `[hotguest]` e
 `[guestwait2]` desde a transição.
+
+## Render v2 — fase 0 e v0.1.53
+
+| Arquivo da v0.1.52 | Mudança desde a v0.1.51 | Risco |
+| --- | --- | --- |
+| `src/mcla_app.cpp` | Amostra o PC da XThread quente e reporta espera pendente e RSS | Sinal de amostragem pode perturbar a thread medida |
+| `patches/rexglue-android-city-trace.patch` | Identifica objetos de espera, mede memória dos alvos e torna visíveis os bytes gravados do cache Vulkan | Custo do rastreio e sinais de semáforo ausentes nessa versão |
+| `.github/workflows/ci.yml`, `scripts/ci/check_pins.py`, `docs/android-build.md` | Registram a ordem e o hash do patch | Patch precisa encaixar no SDK fixado |
+| `docs/android-testing.md` | Registra o teste e as diferenças de perfil | Alteração documental |
+
+A v0.1.52 reportou ~30 FPS no menu e ~1 atualização/s por mais de um minuto
+na transição. O tempo até a corrida continua sem medida porque a corrida
+não foi observada. Os objetos de espera reportaram tipo 8 (semáforo).
+O corpo de `sub_82462BD0` percorre tabelas de códigos de comprimento variável,
+consome bits e escreve símbolos em um buffer. Isso é compatível com uma etapa
+de decodificação, com formato e equivalência do resultado ainda a validar.
+
+Na v0.1.53, habilite **Extras → Rastrear chamadas do host (próximo Play)**.
+`[hostcall]` agrega as dez importações tipadas com maior tempo decorrido
+por thread, a cada 5 s. O tempo inclui bloqueios dentro da chamada.
+`[guestwait2]` também registra liberações válidas de semáforos e, quando a
+chamada veio de uma importação tipada, o endereço da instrução guest que
+chamou a importação. Em liberações concorrentes registra o último sinal
+observado para o objeto. O APK informa a versão e o commit em `[build]`.
