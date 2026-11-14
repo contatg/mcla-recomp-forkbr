@@ -190,28 +190,45 @@ public final class MclaLauncherActivity extends Activity {
         });
         addAction(graphicsCard, systemButton, false);
 
+        if (!isMaliBuild && !MclaBuildVariant.isRedMagicAudioTest(this)) {
+            Button performanceProfile = new Button(this);
+            performanceProfile.setText(performanceProfileLabel());
+            performanceProfile.setOnClickListener(view -> new android.app.AlertDialog.Builder(this)
+                    .setTitle("Graphics performance profile")
+                    .setSingleChoiceItems(MclaPerformanceProfile.LABELS,
+                            MclaPerformanceProfile.selected(this), (dialog, choice) -> {
+                                MclaPerformanceProfile.select(this, choice);
+                                performanceProfile.setText(performanceProfileLabel());
+                                updateDriverStatus();
+                                dialog.dismiss();
+                            })
+                    .setNegativeButton(android.R.string.cancel, null)
+                    .show());
+            addAction(graphicsCard, performanceProfile, false);
+        }
+
         if (!isMaliBuild) {
             graphicsCard.addView(label("Turnip debug (applies on next Play; one at a time)",
                     13, 0xFFA8B9C4, false));
-            final String[] options = {"syncdraw (recommended)", "No switch", "noubwc",
-                    "flushall", "nolrz", "sysmem"};
+            final String[] options = {"Automatic (profile)", "syncdraw", "No switch",
+                    "noubwc", "flushall", "nolrz", "sysmem"};
             turnipDebugSpinner = new Spinner(this);
             turnipDebugSpinner.setAdapter(new ArrayAdapter<>(this,
                     android.R.layout.simple_spinner_dropdown_item, options));
             String current = getSharedPreferences("driver_debug", MODE_PRIVATE)
-                    .getString("tu_debug", "syncdraw");
+                    .getString("tu_debug", "auto");
             int selected = 0;
-            for (int i = 2; i < options.length; i++) {
+            for (int i = 1; i < options.length; i++) {
                 if (options[i].equals(current)) selected = i;
             }
-            if (current.isEmpty()) selected = 1;
+            if (current.isEmpty()) selected = 2;
             turnipDebugSpinner.setSelection(selected);
             turnipDebugSpinner.setOnItemSelectedListener(new android.widget.AdapterView.OnItemSelectedListener() {
                 @Override
                 public void onItemSelected(android.widget.AdapterView<?> parent,
                         View view, int position, long id) {
-                    String value = position == 0 ? "syncdraw" :
-                            position == 1 ? "" : options[position];
+                    String value = position == 0 ? "auto" :
+                            position == 2 ? "" : options[position];
                     getSharedPreferences("driver_debug", MODE_PRIVATE).edit()
                             .putString("tu_debug", value).apply();
                     updateDriverStatus();
@@ -301,6 +318,16 @@ public final class MclaLauncherActivity extends Activity {
         return new File(getFilesDir(), "gpu-drivers");
     }
 
+    private String performanceProfileLabel() {
+        int choice = MclaPerformanceProfile.selected(this);
+        String label = MclaPerformanceProfile.LABELS[choice];
+        if (choice == 0) {
+            label += " (" + ("performance".equals(MclaPerformanceProfile.resolve(this))
+                    ? "Performance" : "Standard") + ")";
+        }
+        return "Graphics: " + label;
+    }
+
     private boolean audioLowLatency() {
         return getSharedPreferences("audio", MODE_PRIVATE)
                 .getBoolean("low_latency", false);
@@ -341,7 +368,8 @@ public final class MclaLauncherActivity extends Activity {
         String suffix = "";
         if (custom && !isMaliBuild) {
             String debug = getSharedPreferences("driver_debug", MODE_PRIVATE)
-                    .getString("tu_debug", "syncdraw");
+                    .getString("tu_debug", "auto");
+            if ("auto".equals(debug)) debug = MclaPerformanceProfile.defaultTurnipDebug(this);
             if (new File(getFilesDir(), "driver.env").isFile()) {
                 suffix = " (driver.env override)";
             } else {

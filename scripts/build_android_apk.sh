@@ -92,6 +92,7 @@ printf '%s\n' "$ROOT/android/MclaLauncherActivity.java" >> "$OUT/stage/java-sour
 printf '%s\n' "$ROOT/android/MclaGameImport.java" >> "$OUT/stage/java-sources.txt"
 printf '%s\n' "$ROOT/android/MclaLogExporter.java" >> "$OUT/stage/java-sources.txt"
 printf '%s\n' "$ROOT/android/MclaBuildVariant.java" >> "$OUT/stage/java-sources.txt"
+printf '%s\n' "$ROOT/android/MclaPerformanceProfile.java" >> "$OUT/stage/java-sources.txt"
 javac -encoding UTF-8 --release 8 -classpath "$PLATFORM" \
     -d "$OUT/stage/classes" @"$OUT/stage/java-sources.txt"
 python3 - "$D8" "$PLATFORM" "$OUT/stage/dex" "$OUT/stage/classes" <<'PY'

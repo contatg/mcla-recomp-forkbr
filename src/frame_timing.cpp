@@ -97,6 +97,13 @@ REXCVAR_DEFINE_BOOL(mcla_pace_at_swap, true, "MCLA",
                     "Hold frames to the FPS target at presentation, like a precise vsync, "
                     "instead of before the game's update");
 
+#ifdef __ANDROID__
+REXCVAR_DEFINE_INT32(mcla_android_frame_spin_us, 1500, "MCLA",
+                     "Android frame limiter: how long to yield at the end of a timed wait")
+    .range(0, 1500)
+    .lifecycle(rex::cvar::Lifecycle::kRequiresRestart);
+#endif
+
 // HALF DISPLAY (mcla_fps_frame_generation = -1): floor(97% of half the refresh rate) rendered,
 // so the presents (twice as many) stay just under what the display takes; 0 where the
 // refresh rate isn't known or is under 100 Hz, where half is under 50 and the
@@ -264,9 +271,16 @@ void WaitForFrameDeadline() {
   if (now < next_us) {
     // Sleep most of the way, then spin the last stretch: sleeps overshoot by
     // up to a millisecond or two, which is a large share of an 8.3 ms frame.
-    constexpr uint64_t kSpinMicros = 1500;
-    if (next_us - now > kSpinMicros + 500) {
-      std::this_thread::sleep_for(std::chrono::microseconds(next_us - now - kSpinMicros));
+    constexpr uint64_t kDefaultSpinMicros = 1500;
+#ifdef __ANDROID__
+    const uint64_t spin_us = REXCVAR_GET(mcla_android_frame_spin_us);
+#else
+    constexpr uint64_t spin_us = kDefaultSpinMicros;
+#endif
+    // Also sleep on short waits in the low-spin modes to save CPU time.
+    const uint64_t min_sleep_us = spin_us == kDefaultSpinMicros ? 500 : 0;
+    if (next_us - now > spin_us + min_sleep_us) {
+      std::this_thread::sleep_for(std::chrono::microseconds(next_us - now - spin_us));
     }
     while (NowMicros() < next_us) {
 #if defined(_WIN32)
@@ -295,6 +309,9 @@ float ReadGuestFloat(uint32_t address) {
 
 void MclaTickButtonPrompts();
 void MclaTickPerfOptions();
+#ifdef __ANDROID__
+void MclaLogAndroidFps();
+#endif
 // The dev pad (src/dev_pad.cpp), a PC development tool the PS5 build doesn't
 // compile: no-ops there.
 #if REX_PLATFORM_PS5
@@ -773,6 +790,9 @@ void mcla_frame_start(PPCRegister& r3) {
 
 void mcla_frame_delta(PPCRegister& r8) {
   mcla::RecordGameUpdate();
+#ifdef __ANDROID__
+  MclaLogAndroidFps();
+#endif
   MclaProfileCountUpdate();
   MclaTickButtonPrompts();
   MclaTickPerfOptions();

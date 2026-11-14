@@ -8,6 +8,7 @@
 #include <cstdint>
 #include <chrono>
 #include <algorithm>
+#include <atomic>
 #include <cstdio>
 #include <cstdlib>
 #include <cstring>
@@ -59,9 +60,9 @@
 #ifdef __ANDROID__
 REXCVAR_DECLARE(int32_t, mcla_fps);  // Defined in frame_timing.cpp.
 REXCVAR_DEFINE_BOOL(mcla_fps_overlay, true, "MCLA",
-                    "Show successful host-present FPS (not guest swaps or display scanout)");
+                    "Show game-update FPS and frame time");
 REXCVAR_DEFINE_BOOL(mcla_fps_log, true, "MCLA",
-                    "Log host-present FPS and interval percentiles every five seconds");
+                    "Log game updates and new guest frames presented every five seconds");
 #endif
 
 REXCVAR_DEFINE_STRING(mcla_gpu_backend, "any", "MCLA",
@@ -115,6 +116,9 @@ bool MclaPrepareShadersIsRequested();  // src/shader_prepare.cpp
 void MclaShaderStorageAfterPreload(rex::Runtime* runtime);
 void MclaMigrateAntiAliasing();  // src/perf_options.cpp
 void MclaApplyPreset();  // src/perf_options.cpp
+#if REX_PLATFORM_ANDROID
+void MclaApplyAndroidPerformanceProfile();
+#endif
 void MclaApplyGraphicsFixDefaults(bool vulkan);  // src/perf_options.cpp
 
 #ifdef _WIN32
@@ -863,6 +867,9 @@ void MclaApp::OnPreSetup(rex::RuntimeConfig& config) {
   ApplyPcDefaults();
   MclaMigrateAntiAliasing();
   MclaApplyPreset();
+#if REX_PLATFORM_ANDROID
+  MclaApplyAndroidPerformanceProfile();
+#endif
 #ifdef _WIN32
   // The GPU the game chose (ChooseGpu) is the one the SDK takes, whatever the API: d3d12_adapter
   // for Direct3D 12, vulkan_device for Vulkan (Automatic's or the player's), whose own choice
@@ -1209,72 +1216,78 @@ void MclaApp::OnPostSetup() {
   }
 }
 
+#ifdef __ANDROID__
+void MclaLogAndroidFps() {
+  if (!REXCVAR_GET(mcla_fps_log)) return;
+  using namespace std::chrono;
+  static std::atomic<uint64_t> last_log_ns{0};
+  const auto now = steady_clock::now();
+  const uint64_t now_ns = duration_cast<nanoseconds>(now.time_since_epoch()).count();
+  uint64_t previous = last_log_ns.load(std::memory_order_relaxed);
+  if (now_ns < previous || now_ns - previous < 5'000'000'000 ||
+      !last_log_ns.compare_exchange_strong(previous, now_ns, std::memory_order_relaxed)) return;
+
+  auto* runtime = rex::Runtime::instance();
+  auto* graphics = runtime ? runtime->graphics_system() : nullptr;
+  auto* presenter = graphics ? graphics->presenter() : nullptr;
+  if (!presenter) return;
+
+  const auto game = mcla::GetGameUpdateStats();
+  auto times = presenter->GetRecentPresentationTimes();
+  const uint64_t cutoff = now_ns - std::min(now_ns, uint64_t(2'000'000'000));
+  times.erase(times.begin(), std::lower_bound(times.begin(), times.end(), cutoff));
+  double fps = 0, p50_ms = 0, p95_ms = 0;
+  if (times.size() >= 2 && times.back() > times.front() &&
+      times.back() >= now_ns - std::min(now_ns, uint64_t(1'000'000'000))) {
+    fps = double(times.size() - 1) * 1e9 / double(times.back() - times.front());
+    std::vector<double> intervals;
+    intervals.reserve(times.size() - 1);
+    for (size_t i = 1; i < times.size(); ++i) {
+      intervals.push_back(double(times[i] - times[i - 1]) / 1e6);
+    }
+    std::sort(intervals.begin(), intervals.end());
+    p50_ms = intervals[(intervals.size() - 1) / 2];
+    p95_ms = intervals[(intervals.size() * 95 + 99) / 100 - 1];
+  }
+  REXLOG_INFO("host presentation (recent 2s): {:.2f} FPS, p50 {:.2f} ms, p95 {:.2f} ms; "
+              "{} samples of new guest frames; "
+              "game updates: {:.2f} FPS, p95 {:.2f} ms",
+              fps, p50_ms, p95_ms, times.size(), game.fps, game.p95_ms);
+}
+#endif
+
 namespace {
 
 #ifdef __ANDROID__
 class FpsCounter final : public rex::ui::ImGuiDialog {
  public:
   explicit FpsCounter(rex::ui::ImGuiDrawer* drawer) : ImGuiDialog(drawer) {}
-  // OnDraw samples the presenter and writes the periodic log. Without UI
-  // repaints neither happens if the guest presents off the UI thread.
-  bool RepaintsContinuously() const override {
-    return REXCVAR_GET(mcla_fps_overlay) || REXCVAR_GET(mcla_fps_log);
-  }
+  bool RepaintsContinuously() const override { return REXCVAR_GET(mcla_fps_overlay); }
 
  protected:
   void OnDraw(ImGuiIO&) override {
-    const bool overlay = REXCVAR_GET(mcla_fps_overlay);
-    const bool logging = REXCVAR_GET(mcla_fps_log);
-    if (!overlay && !logging) return;
+    if (!REXCVAR_GET(mcla_fps_overlay)) return;
     const auto now = std::chrono::steady_clock::now();
     if (now - sampled_ >= std::chrono::milliseconds(500)) {
       sampled_ = now;
-      auto* runtime = rex::Runtime::instance();
-      auto* graphics = runtime ? runtime->graphics_system() : nullptr;
-      auto* presenter = graphics ? graphics->presenter() : nullptr;
-      if (!presenter) return;
-      auto times = presenter->GetRecentPresentationTimes();
-      const uint64_t now_ns = std::chrono::duration_cast<std::chrono::nanoseconds>(
-          now.time_since_epoch()).count();
-      const uint64_t cutoff = now_ns > 2'000'000'000 ? now_ns - 2'000'000'000 : 0;
-      times.erase(times.begin(), std::lower_bound(times.begin(), times.end(), cutoff));
-      fps_ = p50_ = p95_ = 0;
-      if (times.size() >= 2 && times.back() > times.front()) {
-        fps_ = double(times.size() - 1) * 1e9 / double(times.back() - times.front());
-        std::vector<double> intervals;
-        for (size_t i = 1; i < times.size(); ++i) {
-          intervals.push_back(double(times[i] - times[i - 1]) / 1e6);
-        }
-        std::sort(intervals.begin(), intervals.end());
-        p50_ = intervals[(intervals.size() - 1) / 2];
-        p95_ = intervals[(intervals.size() * 95 + 99) / 100 - 1];
-      }
-      if (logging && now - logged_ >= std::chrono::seconds(5)) {
-        logged_ = now;
-        REXLOG_INFO("host presentation (recent 2s): {:.2f} FPS, p50 {:.2f} ms, p95 {:.2f} ms; "
-                    "{} samples, not display scanout", fps_, p50_, p95_, times.size());
-      }
-    }
-    if (overlay) {
-      char text[80];
       const auto game = mcla::GetGameUpdateStats();
       if (game.samples) {
-        std::snprintf(text, sizeof(text), "Game updates %.1f FPS  p95 %.0f ms",
+        std::snprintf(text_, sizeof(text_), "Game updates %.1f FPS  p95 %.0f ms",
                       game.fps, game.p95_ms);
       } else {
-        std::snprintf(text, sizeof(text), "Game updates --");
+        std::snprintf(text_, sizeof(text_), "Game updates --");
       }
-      auto* draw = ImGui::GetForegroundDrawList();
-      const ImVec2 size = ImGui::CalcTextSize(text);
-      draw->AddRectFilled(ImVec2(10, 10), ImVec2(22 + size.x, 22 + size.y),
-                          IM_COL32(0, 0, 0, 180), 4);
-      draw->AddText(ImVec2(16, 16), IM_COL32(255, 255, 255, 255), text);
     }
+    auto* draw = ImGui::GetForegroundDrawList();
+    const ImVec2 size = ImGui::CalcTextSize(text_);
+    draw->AddRectFilled(ImVec2(10, 10), ImVec2(22 + size.x, 22 + size.y),
+                        IM_COL32(0, 0, 0, 180), 4);
+    draw->AddText(ImVec2(16, 16), IM_COL32(255, 255, 255, 255), text_);
   }
 
  private:
-  std::chrono::steady_clock::time_point sampled_{}, logged_{};
-  double fps_ = 0, p50_ = 0, p95_ = 0;
+  std::chrono::steady_clock::time_point sampled_{};
+  char text_[80] = "Game updates --";
 };
 #endif
 

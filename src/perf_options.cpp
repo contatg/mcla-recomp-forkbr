@@ -15,6 +15,7 @@
 #include <cstring>
 #include <mutex>
 #include <string>
+#include <utility>
 #include <vector>
 
 #include <rex/cvar.h>
@@ -123,6 +124,13 @@ REXCVAR_DEFINE_STRING(mcla_preset, "custom", "MCLA",
                       " lowest: as low, and no real-time shadows\n"
                       "An option set by hand keeps its value")
     .allowed({"custom", "low", "lowest"});
+
+#if REX_PLATFORM_ANDROID
+REXCVAR_DEFINE_STRING(mcla_android_performance, "standard", "MCLA",
+                      "Android graphics profile: standard, performance or maximum")
+    .allowed({"standard", "performance", "maximum"})
+    .lifecycle(rex::cvar::Lifecycle::kRequiresRestart);
+#endif
 
 // For measuring what an option is worth. The title screen's camera wanders, so
 // two runs never show the same scene; this switches the named option between
@@ -605,6 +613,53 @@ void MclaApplyPreset() {
   }
   REXLOG_INFO("perf options: preset {}", preset);
 }
+
+#if REX_PLATFORM_ANDROID
+void MclaApplyAndroidPerformanceProfile() {
+  const std::string profile = REXCVAR_GET(mcla_android_performance);
+  REXLOG_INFO("Android performance profile: {}", profile);
+  if (profile == "standard") return;
+
+  const bool maximum = profile == "maximum";
+  const std::pair<const char*, const char*> options[] = {
+      {"mcla_anti_aliasing", "off"},
+      {"mcla_fullscreen_blur", "false"},
+      {"mcla_shadows", "false"},
+      {"mcla_race_shadows", "false"},
+      {"mcla_fast_car_shadows", "true"},
+      {"mcla_foliage_shadows", "false"},
+      {"mcla_city_lod", maximum ? "0.5" : "0.75"},
+      {"mcla_traffic_lod", "0.5"},
+      {"mcla_traffic_distance", maximum ? "180" : "250"},
+      {"mcla_pedestrians", maximum ? "0" : "0.5"},
+      {"mcla_parked_cars", maximum ? "0" : "0.5"},
+      {"anisotropic_override", maximum ? "0" : "2"},
+      {"vulkan_pipeline_creation_threads", "2"},
+      {"vulkan_occlusion_query_pipeline_wait_ms", maximum ? "2" : "8"},
+      {"mcla_android_frame_spin_us", maximum ? "0" : "300"},
+      {"mcla_fps_overlay", "false"},
+  };
+  const auto apply = [&profile](const auto& settings) {
+    for (const auto& [name, value] : settings) {
+      if (rex::cvar::GetFlagSource(name) == rex::cvar::Source::kDefault &&
+          !rex::cvar::SetDefaultValue(name, value)) {
+        REXLOG_WARN("Android performance profile {}: {} = {} not applied", profile, name, value);
+      }
+    }
+  };
+  apply(options);
+  if (maximum) {
+    // Keep the known working 720-line mode, with fewer pixels on wide screens.
+    // Keep the environment map at full rate to avoid black flashes on car paint.
+    constexpr std::pair<const char*, const char*> kMaximum[] = {
+        {"mcla_aspect_ratio", "16:9"},
+        {"mcla_reflection_interval", "2"},
+        {"vulkan_occlusion_query_async_pipelines", "true"},
+    };
+    apply(kMaximum);
+  }
+}
+#endif
 
 void MclaMigrateAntiAliasing() {
   if (rex::cvar::GetFlagSource("mcla_anti_aliasing") == rex::cvar::Source::kDefault &&

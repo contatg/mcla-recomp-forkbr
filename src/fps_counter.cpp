@@ -28,8 +28,8 @@ void RecordGameUpdate() {
 
 GameUpdateStats GetGameUpdateStats() {
   GameUpdateStats result{};
-  const uint64_t now = NowNs();
   std::lock_guard lock(mutex);
+  const uint64_t now = NowNs();
   const size_t count = std::min(total_updates, updates.size());
   std::vector<double> intervals;
   uint64_t previous = 0;

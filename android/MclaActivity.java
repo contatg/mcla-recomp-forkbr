@@ -76,6 +76,7 @@ public final class MclaActivity extends SDLActivity {
         applyAudioEnvironment();
         applyRedMagicShaderEnvironment();
         applyLogEnvironment();
+        applyPerformanceEnvironment();
         applyDriverDebugEnvironment();
         File source = new File(getApplicationInfo().nativeLibraryDir, "librexgpu-xenos.so");
         File target = new File(getFilesDir(), "librexgpu-xenos.so");
@@ -174,6 +175,16 @@ public final class MclaActivity extends SDLActivity {
         }
     }
 
+    private void applyPerformanceEnvironment() {
+        String profile = MclaPerformanceProfile.resolve(this);
+        try {
+            Os.setenv("REX_MCLA_ANDROID_PERFORMANCE", profile, true);
+            Log.i(TAG, "Graphics performance profile: " + profile);
+        } catch (Exception e) {
+            Log.e(TAG, "Could not apply graphics performance profile", e);
+        }
+    }
+
     private void applyDriverDebugEnvironment() {
         // The Vulkan driver is loaded during SDLActivity.onCreate. Keep this
         // private, opt-in diagnostic setting outside mcla.toml and apply it first.
@@ -220,7 +231,8 @@ public final class MclaActivity extends SDLActivity {
             } else if (debug == null) {
                 // Launcher setting; explicit driver.env takes precedence.
                 debug = getSharedPreferences("driver_debug", MODE_PRIVATE)
-                        .getString("tu_debug", "syncdraw");
+                        .getString("tu_debug", "auto");
+                if ("auto".equals(debug)) debug = MclaPerformanceProfile.defaultTurnipDebug(this);
                 if (!debug.equals("syncdraw") && !debug.equals("noubwc") &&
                         !debug.equals("flushall") && !debug.equals("nolrz") &&
                         !debug.equals("sysmem")) {

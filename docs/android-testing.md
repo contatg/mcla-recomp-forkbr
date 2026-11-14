@@ -92,33 +92,41 @@ Graphics, Extras and Launch sections. The same import, driver selection,
 shader-pack, touch-editor and Play actions remain available; the appearance
 does not change Vulkan behavior.
 
-## FPS Counter (cleaner overlay)
+## Snapdragon 680 performance
 
-Since v0.1.41, a new FPS counter is integrated into the frame timing system (`mcla_frame_delta` hook). It provides:
+Choose a profile under **Graphics** before pressing **Play**. Automatic selects
+**Performance** when Android 12 or newer reports `SM6225` as its SoC model. The
+profile can also be selected manually.
 
-- **Per-frame timing** with a rolling 240-frame window (~4 seconds at 60 FPS)
-- **Menu vs gameplay separation** (detected via render height < 800px)
-- **Detailed percentiles**: p50, p90, p95, p99, 1% low (p99), 0.1% low (p99.9)
-- **CPU/GPU timing** separation
-- **Separate logging** for menu vs gameplay
+| Profile | Graphics settings |
+| --- | --- |
+| Standard | Uses the regular game and Vulkan settings. |
+| Performance | Disables real-time shadows, MSAA and blur. Uses simpler car shadows, 2× anisotropy, shorter traffic distance and fewer pedestrians and parked cars. |
+| Maximum performance | Reduces city detail further, turns off anisotropy, removes pedestrians and parked cars, and updates reflections every other frame. Uses a 16:9 guest image at 720 lines, so wide displays can have side bars. |
 
-**Important:** The FPS counter only activates during actual gameplay. The app starts in the launcher UI; the frame timing hooks (`mcla_frame_delta`, etc.) are only triggered after pressing "Play" in the launcher and the actual game loop starts.
+Both performance profiles limit Vulkan pipeline creation to two workers, shorten
+waits for queued pipelines during occlusion queries, and spend less CPU time
+waiting for the frame deadline. Maximum performance also compiles eligible
+occlusion-query pipelines in the background. During compilation, the query can
+temporarily treat draws that have no pipeline yet as hidden.
 
-**Configuration (in `files/mcla.toml`):**
-```toml
-mcla_fps_counter_enabled = true
-mcla_fps_counter_window_frames = 120  # 2 seconds at 60 FPS
-mcla_fps_counter_log_interval_ms = 5000
-mcla_fps_counter_separate_menu = true
-```
+When a custom Turnip driver is selected, **Automatic (profile)** disables
+`syncdraw` for both performance profiles. Select `syncdraw` manually if the
+driver shows flickering wheels or rear lights. Settings already saved in
+`mcla.toml` have priority over the profile defaults.
 
-**Log output example:**
-```
-FPS [GAME]: frames=180 avg=22.4 p50=44.6ms p95=67.2ms p99=89.1ms 1%low=89.1ms 0.1%low=112.3ms
-FPS [MENU]: frames=45 avg=58.2 p50=17.2ms p95=18.1ms p99=18.5ms
-```
+## Measuring FPS
 
-**Note:** The FPS counter only activates during actual gameplay. The app starts in the launcher UI; the frame timing hooks are only triggered after pressing "Play" in the launcher.
+Drive the same route for at least two minutes per profile with the same driver.
+Run the route once before measuring to give the shader cache time to warm up.
+The target on Snapdragon 680 is at least 20 new guest frames presented per
+second while driving. This still needs testing on the device.
+
+The Android log reports both new guest frames successfully presented by the
+host and game updates, with a 95th-percentile frame interval for each. Repaints
+of the same guest image do not count as new frames. Both performance profiles
+turn off the on-screen FPS overlay by default and keep the log active.
+The optional `mcla_fps_overlay` and `mcla_fps_log` settings are in `files/mcla.toml`.
 
 ## No game sound until recording starts
 
