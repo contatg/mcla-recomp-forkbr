@@ -45,6 +45,7 @@ public final class MclaActivity extends SDLActivity {
         for (int id : InputDevice.getDeviceIds()) {
             InputDevice device = InputDevice.getDevice(id);
             if (device == null || device.isVirtual()) continue;
+            if (Build.VERSION.SDK_INT >= 29 && !device.isExternal()) continue;
             int sources = device.getSources();
             if ((sources & InputDevice.SOURCE_GAMEPAD) == InputDevice.SOURCE_GAMEPAD ||
                     (sources & InputDevice.SOURCE_JOYSTICK) == InputDevice.SOURCE_JOYSTICK) {
@@ -88,6 +89,7 @@ public final class MclaActivity extends SDLActivity {
             mLayout.addView(touchControls, new RelativeLayout.LayoutParams(
                     RelativeLayout.LayoutParams.MATCH_PARENT,
                     RelativeLayout.LayoutParams.MATCH_PARENT));
+            touchControls.bringToFront();
             inputManager = (InputManager) getSystemService(Context.INPUT_SERVICE);
             if (inputManager != null) inputManager.registerInputDeviceListener(gamepadListener, logHandler);
             updateGamepad();

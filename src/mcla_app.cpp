@@ -875,6 +875,11 @@ void MclaApp::OnPreSetup(rex::RuntimeConfig& config) {
     rex::cvar::SetDefaultValue("texture_load_direct_unscaled", "false");
     rex::cvar::SetDefaultValue("vulkan_dynamic_rendering", "false");
     rex::cvar::SetDefaultValue("mcla_aspect_ratio", "16:9");
+    rex::cvar::SetDefaultValue("present_ui_overlay", "false");
+    rex::cvar::SetDefaultValue("mcla_fps_overlay", "false");
+    rex::cvar::SetDefaultValue("vulkan_async_skip_incomplete_frames", "false");
+    rex::cvar::SetDefaultValue("async_pipeline_wait_budget_ms", "1");
+    REXLOG_INFO("Adreno 610: presenting partial frames without the Vulkan UI layer");
     REXLOG_INFO("Adreno 610 compatibility: direct texture loads={}, dynamic rendering={}, aspect={}",
                 rex::cvar::GetFlagByName("texture_load_direct_unscaled"),
                 rex::cvar::GetFlagByName("vulkan_dynamic_rendering"),

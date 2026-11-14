@@ -5,8 +5,6 @@ import android.graphics.Canvas;
 import android.graphics.Color;
 import android.graphics.Paint;
 import android.content.SharedPreferences;
-import android.os.Handler;
-import android.os.Looper;
 import android.view.MotionEvent;
 import android.view.View;
 import java.util.HashMap;
@@ -14,10 +12,8 @@ import java.util.Map;
 
 /** Xbox-style multitouch pad over the SDL surface. This is an Android-only prototype. */
 public final class MclaTouchControls extends View {
-    private static final long IDLE_MS = 6000;
     private static final int LEFT_STICK = 0x10000, RIGHT_STICK = 0x20000;
     private static final int LT = 0x40000, RT = 0x80000;
-    private final Handler handler = new Handler(Looper.getMainLooper());
     private final Paint paint = new Paint(Paint.ANTI_ALIAS_FLAG);
     private final Map<Integer, Integer> fingers = new HashMap<>();
     private final Map<Integer, float[]> positions = new HashMap<>();
@@ -27,17 +23,7 @@ public final class MclaTouchControls extends View {
     private final boolean editing;
     private int dragPointer = -1;
     private int dragControl;
-    private boolean showing = true;
     private boolean gamepadConnected;
-    private final Runnable hideIdle = new Runnable() {
-        @Override public void run() {
-            if (!gamepadConnected && fingers.isEmpty()) {
-                showing = false;
-                invalidate();
-            }
-        }
-    };
-
     private static native void nativeSetState(int buttons, int lt, int rt,
                                                 int lx, int ly, int rx, int ry);
 
@@ -50,7 +36,6 @@ public final class MclaTouchControls extends View {
         this.editing = editing;
         layout = context.getSharedPreferences("touch_layout", Context.MODE_PRIVATE);
         setFocusable(false);
-        if (!editing) scheduleHide();
     }
 
     public void setSizePercent(int percent) {
@@ -71,8 +56,6 @@ public final class MclaTouchControls extends View {
         gamepadConnected = connected;
         clearInput();
         setVisibility(connected ? GONE : VISIBLE);
-        showing = !connected;
-        if (!connected) scheduleHide();
         invalidate();
     }
 
@@ -81,18 +64,11 @@ public final class MclaTouchControls extends View {
         positions.clear();
         stickOrigins.clear();
         if (!editing) nativeSetState(0, 0, 0, 0, 0, 0, 0);
-        handler.removeCallbacks(hideIdle);
         invalidate();
     }
 
     public void resumeControls() {
-        if (!gamepadConnected) scheduleHide();
-    }
-
-    private void scheduleHide() {
-        handler.removeCallbacks(hideIdle);
-        if (!editing && !gamepadConnected && fingers.isEmpty())
-            handler.postDelayed(hideIdle, IDLE_MS);
+        invalidate();
     }
 
     private float r() {
@@ -208,7 +184,6 @@ public final class MclaTouchControls extends View {
         int action = event.getActionMasked();
         int index = event.getActionIndex();
         if (action == MotionEvent.ACTION_DOWN || action == MotionEvent.ACTION_POINTER_DOWN) {
-            showing = true;
             int id = event.getPointerId(index);
             int control = hit(event.getX(index), event.getY(index));
             if (control != 0) {
@@ -217,11 +192,9 @@ public final class MclaTouchControls extends View {
                     stickOrigins.put(id, new float[] {event.getX(index), event.getY(index)});
                 }
             }
-            handler.removeCallbacks(hideIdle);
         }
         if (action == MotionEvent.ACTION_CANCEL) {
             clearInput();
-            scheduleHide();
         } else {
             for (int i = 0; i < event.getPointerCount(); i++) {
                 int id = event.getPointerId(i);
@@ -235,7 +208,6 @@ public final class MclaTouchControls extends View {
                 stickOrigins.remove(id);
             }
             sendState();
-            scheduleHide();
         }
         invalidate();
         return true;
@@ -276,7 +248,7 @@ public final class MclaTouchControls extends View {
 
     @Override protected void onDraw(Canvas canvas) {
         super.onDraw(canvas);
-        if (!showing || gamepadConnected) return;
+        if (gamepadConnected) return;
         for (int i = 0; i < CONTROLS.length; i++) {
             int control = CONTROLS[i];
             float radius = r() * (i < 2 ? 1.28f : i >= 10 && i <= 13 ? .52f : .66f);
