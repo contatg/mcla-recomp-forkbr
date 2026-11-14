@@ -48,3 +48,24 @@ exporte também o diagnóstico e inclua as linhas `[build]`, `[driver]`,
 `[pipe]`, `[tex]` e `[present]`. **Antiga** abre o jogo com os dados já
 importados e com o cache que ele já usa. A F1 não inicializa o guest e seus
 FPS medem somente a apresentação do padrão.
+
+## F2 — simulação com rasterização desligada
+
+A v0.1.55 mostrou todas as regiões do padrão no Snapdragon 680, com 27,26 FPS
+no print e 440 apresentações registradas antes da pausa. Esses números
+medem somente a F1.
+
+A Nova agora inicia o XEX pelo botão **Play**. Seu frontend reutiliza a
+interpretação PM4, os registradores, as interrupções e o write-back do
+ponteiro de leitura do ReXGlue. O backend de diagnóstico descarta
+microcódigo, draws e resolves. Um worker publica o quadro azul quando
+recebe swaps, com um único pedido pendente para evitar criar uma fila
+quando a apresentação atrasa. A opção Antiga usa a fábrica e o cache
+Xenos existentes. O padrão F1 segue disponível em Extras.
+
+No teste F2, use a mesma sequência de controles que usava para chegar à
+cidade com a Antiga. Como a saída é azul, confirme o avanço pelos sons e
+pelas linhas `[stage]` e `[present]`. Envie o diagnóstico e anote até que
+ponto conseguiu avançar. Se a simulação continuar lenta, `[hostcall]` e
+`[guestwait2]` ajudam a separar espera por trabalho do guest de espera por
+dados ausentes que um resolve ou memexport normalmente produziria.

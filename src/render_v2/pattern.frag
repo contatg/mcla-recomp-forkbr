@@ -7,7 +7,9 @@ layout(push_constant) uniform Draw { int triangle; } draw;
 layout(set = 0, binding = 0) uniform usamplerBuffer pattern_texture;
 
 void main() {
-    if (draw.triangle != 0) {
+    if (draw.triangle == 2) {
+        color = vec4(0.06, 0.22, 0.46, 1.0);
+    } else if (draw.triangle == 1) {
         color = vec4(1.0, 0.78, 0.18, 1.0);
     } else if (uv.y < 0.5 && uv.x < 0.5) {
         int band = clamp(int(uv.x * 8.0), 0, 3);

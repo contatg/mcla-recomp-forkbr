@@ -173,8 +173,9 @@ public final class MclaActivity extends SDLActivity {
         try {
             Os.setenv("REX_LOG_FILE", new File(directory, "mcla.log").getAbsolutePath(), true);
             Os.setenv("MCLA_ANDROID_RENDER",
-                    getSharedPreferences("renderer", MODE_PRIVATE)
-                        .getBoolean("render_v2", true) ? "new" : "old", true);
+                    getIntent().getBooleanExtra("mcla_pattern_test", false) ? "pattern"
+                        : (getSharedPreferences("renderer", MODE_PRIVATE)
+                            .getBoolean("render_v2", true) ? "new" : "old"), true);
             Os.setenv("MCLA_ANDROID_VERSION",
                     getPackageManager().getPackageInfo(getPackageName(), 0).versionName, true);
             Os.setenv("REX_MCLA_HOST_CALL_TRACE",

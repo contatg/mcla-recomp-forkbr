@@ -98,6 +98,9 @@ void MclaApp::OnPreLaunchModule() {
   std::string out_path = REXCVAR_GET(mcla_scan_code_pointers);
   if (out_path.empty()) {
     InstallCrashTrace();
+#ifdef __ANDROID__
+    if (render_v2_) return;
+#endif
     MclaShaderStorageBeforeLaunch(runtime(), window(), /*then_play=*/false);
     return;
   }

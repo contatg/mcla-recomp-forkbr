@@ -62,6 +62,7 @@ class MclaApp : public rex::ReXApp {
 #ifdef __ANDROID__
   std::jthread diagnostics_thread_;
   rex::system::IGraphicsSystem* render_v2_ = nullptr;
+  bool render_v2_pattern_ = false;
 #endif
   std::unique_ptr<rex::ui::ImGuiDialog> video_borders_;
   std::unique_ptr<rex::ui::ImGuiDialog> fps_counter_;

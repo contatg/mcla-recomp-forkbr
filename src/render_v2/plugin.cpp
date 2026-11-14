@@ -1,5 +1,6 @@
 #include <rex/android_diagnostics.h>
 #include <rex/logging.h>
+#include <rex/platform/dynlib.h>
 #include <rex/system/gpu_plugin.h>
 #include <rex/system/interfaces/graphics.h>
 #include <rex/ui/vulkan/presenter.h>
@@ -8,6 +9,7 @@
 #include <array>
 #include <chrono>
 #include <condition_variable>
+#include <cstdlib>
 #include <memory>
 #include <mutex>
 #include <string_view>
@@ -22,8 +24,8 @@ constexpr VkExtent2D kPatternExtent{960, 540};
 
 class PatternRenderer {
  public:
-  PatternRenderer(VulkanPresenter& presenter, const rex::ui::vulkan::VulkanDevice& gpu)
-      : presenter_(presenter), gpu_(gpu), vk_(gpu_.functions()) {}
+  PatternRenderer(VulkanPresenter& presenter, const rex::ui::vulkan::VulkanDevice& gpu, bool solid)
+      : presenter_(presenter), gpu_(gpu), vk_(gpu_.functions()), solid_(solid) {}
 
   ~PatternRenderer() {
     if (command_pool_) vk_.vkDestroyCommandPool(gpu_.device(), command_pool_, nullptr);
@@ -282,10 +284,11 @@ class PatternRenderer {
     vk_.vkCmdBindPipeline(command_buffer_, VK_PIPELINE_BIND_POINT_GRAPHICS, pipeline_);
     vk_.vkCmdBindDescriptorSets(command_buffer_, VK_PIPELINE_BIND_POINT_GRAPHICS, layout_, 0, 1,
                                 &texture_set_, 0, nullptr);
-    for (int32_t triangle = 0; triangle < 2; ++triangle) {
+    const int32_t first_draw = solid_ ? 2 : 0;
+    for (int32_t draw = first_draw; draw < (solid_ ? 3 : 2); ++draw) {
       vk_.vkCmdPushConstants(command_buffer_, layout_, VK_SHADER_STAGE_FRAGMENT_BIT, 0,
-                             sizeof(triangle), &triangle);
-      vk_.vkCmdDraw(command_buffer_, 3, 1, uint32_t(triangle) * 3u, 0);
+                             sizeof(draw), &draw);
+      vk_.vkCmdDraw(command_buffer_, 3, 1, draw == 1 ? 3u : 0u, 0);
     }
     vk_.vkCmdEndRenderPass(command_buffer_);
     if (vk_.vkEndCommandBuffer(command_buffer_) != VK_SUCCESS ||
@@ -315,6 +318,7 @@ class PatternRenderer {
   VkBufferView texture_view_ = VK_NULL_HANDLE;
   VkDescriptorPool descriptors_ = VK_NULL_HANDLE;
   VkDescriptorSetLayout descriptor_layout_ = VK_NULL_HANDLE;
+  const bool solid_;
   VkDescriptorSet texture_set_ = VK_NULL_HANDLE;
 };
 
@@ -332,8 +336,26 @@ class RenderV2 final : public rex::system::IGraphicsSystem {
 
   rex::X_STATUS SetupGuestGpu(rex::runtime::FunctionDispatcher* dispatcher,
                               rex::system::KernelState* kernel) override {
-    if (dispatcher || kernel || !presenter_) return X_STATUS_UNSUCCESSFUL;
+    if (!presenter_ || bool(dispatcher) != bool(kernel)) return X_STATUS_UNSUCCESSFUL;
     if (worker_.joinable()) return X_STATUS_SUCCESS;
+    guest_mode_ = dispatcher != nullptr;
+    if (guest_mode_) {
+      using Create = rex::system::IGraphicsSystem* (*)(uint32_t, void (*)(void*), void*);
+      if (!frontend_library_.Load("librexgpu-xenos.so",
+                                  rex::platform::SymbolResolution::kImmediate)) {
+        REXLOG_ERROR("[gpu-null] frontend_load=failed");
+        return X_STATUS_UNSUCCESSFUL;
+      }
+      const auto create = frontend_library_.GetSymbol<Create>("rex_gpu_create_null_guest");
+      if (create) frontend_.reset(create(rex::system::kGpuPluginAbiVersion, NotifySwap, this));
+      if (!frontend_) {
+        REXLOG_ERROR("[gpu-null] frontend_create=failed");
+        return X_STATUS_UNSUCCESSFUL;
+      }
+      const auto status = frontend_->SetupGuestGpu(dispatcher, kernel);
+      if (XFAILED(status)) return status;
+      REXLOG_INFO("[gpu-null] frontend=rexglue-xenos raster=off resolves=off");
+    }
     worker_ = std::jthread([this](std::stop_token stop) { PresentPattern(stop); });
     return X_STATUS_SUCCESS;
   }
@@ -342,23 +364,52 @@ class RenderV2 final : public rex::system::IGraphicsSystem {
   bool has_presentation() const override { return bool(presenter_); }
   rex::ui::GraphicsProvider* provider() const override { return provider_.get(); }
   rex::ui::Presenter* presenter() const override { return presenter_.get(); }
+
+  void SetInterruptCallback(uint32_t callback, uint32_t data) override {
+    if (frontend_) frontend_->SetInterruptCallback(callback, data);
+  }
+  void InitializeRingBuffer(uint32_t pointer, uint32_t size_log2) override {
+    if (frontend_) frontend_->InitializeRingBuffer(pointer, size_log2);
+  }
+  void EnableReadPointerWriteBack(uint32_t pointer, uint32_t size_log2) override {
+    if (frontend_) frontend_->EnableReadPointerWriteBack(pointer, size_log2);
+  }
+  uint32_t edram_tile_count() const override {
+    return frontend_ ? frontend_->edram_tile_count() : 0;
+  }
+
   void Shutdown() override {
-    if (!worker_.joinable()) return;
-    worker_.request_stop();
-    worker_.join();
+    if (worker_.joinable()) {
+      worker_.request_stop();
+      worker_.join();
+    }
+    if (frontend_) {
+      frontend_->Shutdown();
+      frontend_.reset();
+    }
   }
 
  private:
+  static void NotifySwap(void* context) {
+    auto& self = *static_cast<RenderV2*>(context);
+    {
+      std::lock_guard lock(self.swap_mutex_);
+      ++self.guest_swaps_;
+    }
+    self.swap_wake_.notify_one();
+  }
+
   void PresentPattern(std::stop_token stop) {
     using namespace std::chrono;
+    const char* phase = guest_mode_ ? "F2" : "F1";
     const auto* device = provider_->vulkan_device();
     if (!device || presenter_->vulkan_device() != device) {
-      REXLOG_ERROR("[present] backend=render-v2 phase=F1 device_binding=failed");
+      REXLOG_ERROR("[present] backend=render-v2 phase={} device_binding=failed", phase);
       rex::FlushLogging();
       return;
     }
-    REXLOG_INFO("[present] backend=render-v2 phase=F1 device_binding=ok");
-    PatternRenderer renderer(*presenter_, *device);
+    REXLOG_INFO("[present] backend=render-v2 phase={} device_binding=ok", phase);
+    PatternRenderer renderer(*presenter_, *device, guest_mode_);
     if (!renderer.Initialize()) {
       REXLOG_ERROR("[present] backend=render-v2 pattern_init=failed");
       return;
@@ -366,36 +417,55 @@ class RenderV2 final : public rex::system::IGraphicsSystem {
     std::mutex mutex;
     std::condition_variable_any timer;
     std::unique_lock lock(mutex);
+    uint64_t consumed = 0;
     unsigned submitted = 0;
     unsigned failed = 0;
     auto report = steady_clock::now() + seconds(1);
     auto last_report = steady_clock::now();
     auto previous_presented = rex::GetAndroidDiagnostics().presented.load();
     while (!stop.stop_requested()) {
-      if (renderer.Present())
-        ++submitted;
-      else
-        ++failed;
+      uint64_t swaps = 0;
+      if (guest_mode_) {
+        std::unique_lock swap_lock(swap_mutex_);
+        swap_wake_.wait_until(swap_lock, stop, report, [&] { return guest_swaps_ != consumed; });
+        swaps = guest_swaps_;
+      }
+      if (stop.stop_requested()) break;
+      if (!guest_mode_ || swaps != consumed || (!submitted && !failed)) {
+        consumed = swaps;
+        if (renderer.Present())
+          ++submitted;
+        else
+          ++failed;
+      }
       const auto now = steady_clock::now();
       if (now >= report) {
         const auto presented = rex::GetAndroidDiagnostics().presented.load();
         const auto fps =
             double(presented - previous_presented) / duration<double>(now - last_report).count();
         REXLOG_INFO(
-            "[present] backend=render-v2 phase=F1 pattern_submitted={} presented={} failed={}",
-            submitted, presented, failed);
-        REXLOG_INFO("host presentation (recent 2s): {:.2f} FPS, phase=F1 game_updates=0", fps);
+            "[present] backend=render-v2 phase={} guest_swaps={} submitted={} presented={} "
+            "failed={}",
+            phase, swaps, submitted, presented, failed);
+        if (!guest_mode_)
+          REXLOG_INFO("host presentation (recent 2s): {:.2f} FPS, phase=F1 game_updates=0", fps);
         previous_presented = presented;
         last_report = now;
         report = now + seconds(1);
         rex::FlushLogging();
       }
-      timer.wait_for(lock, stop, milliseconds(33), [] { return false; });
+      if (!guest_mode_) timer.wait_for(lock, stop, milliseconds(33), [] { return false; });
     }
   }
 
   std::unique_ptr<rex::ui::vulkan::VulkanProvider> provider_;
   std::unique_ptr<VulkanPresenter> presenter_;
+  rex::platform::DynamicLibrary frontend_library_;
+  std::unique_ptr<rex::system::IGraphicsSystem> frontend_;
+  bool guest_mode_ = false;
+  std::mutex swap_mutex_;
+  std::condition_variable_any swap_wake_;
+  uint64_t guest_swaps_ = 0;
   std::jthread worker_;
 };
 }  // namespace

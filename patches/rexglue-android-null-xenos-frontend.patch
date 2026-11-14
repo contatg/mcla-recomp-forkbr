@@ -1,0 +1,67 @@
+diff --git a/src/graphics/plugin_main.cpp b/src/graphics/plugin_main.cpp
+index ec756d3..9316129 100644
+--- a/src/graphics/plugin_main.cpp
++++ b/src/graphics/plugin_main.cpp
+@@ -21,6 +21,62 @@
+ #include <rex/graphics/vulkan/graphics_system.h>
+ #endif
+ 
++#if REX_PLATFORM_ANDROID && REX_HAS_VULKAN
++namespace {
++using rex::graphics::CommandProcessor;
++using rex::graphics::GraphicsSystem;
++
++// Share the Xbox command front end with the diagnostic renderer. The regular
++// Xenos factory below still constructs its original Vulkan back end.
++class NullDrawCommandProcessor final : public CommandProcessor {
++ public:
++  using Swap = void (*)(void*);
++  NullDrawCommandProcessor(GraphicsSystem* graphics, rex::system::KernelState* kernel,
++                           Swap swap, void* context)
++      : CommandProcessor(graphics, kernel), swap_(swap), context_(context) {}
++
++  void IssueSwap(uint32_t, uint32_t, uint32_t) override { swap_(context_); }
++
++ private:
++  bool SetupContext() override { return true; }
++  void ShutdownContext() override {}
++  rex::graphics::Shader* LoadShader(rex::graphics::xenos::ShaderType, uint32_t,
++                                   const uint32_t*, uint32_t) override {
++    return nullptr;
++  }
++  bool IssueDraw(rex::graphics::xenos::PrimitiveType, uint32_t, IndexBufferInfo*, bool) override {
++    return true;
++  }
++  bool IssueCopy() override { return true; }
++
++  Swap swap_;
++  void* context_;
++};
++
++class NullDrawGraphicsSystem final : public GraphicsSystem {
++ public:
++  NullDrawGraphicsSystem(NullDrawCommandProcessor::Swap swap, void* context)
++      : swap_(swap), context_(context) {}
++  std::string name() const override { return "Xenos null draw"; }
++
++ private:
++  void CreateProvider(bool) override {}
++  std::unique_ptr<CommandProcessor> CreateCommandProcessor() override {
++    return std::make_unique<NullDrawCommandProcessor>(this, kernel_state_, swap_, context_);
++  }
++
++  NullDrawCommandProcessor::Swap swap_;
++  void* context_;
++};
++}  // namespace
++
++extern "C" REX_GPU_PLUGIN_EXPORT rex::system::IGraphicsSystem* rex_gpu_create_null_guest(
++    uint32_t abi, void (*swap)(void*), void* context) {
++  if (abi != rex::system::kGpuPluginAbiVersion || !swap) return nullptr;
++  return new NullDrawGraphicsSystem(swap, context);
++}
++#endif
++
+ extern "C" REX_GPU_PLUGIN_EXPORT uint32_t rex_gpu_abi_version(void) {
+   return rex::system::kGpuPluginAbiVersion;
+ }

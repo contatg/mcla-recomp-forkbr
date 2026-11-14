@@ -109,7 +109,8 @@ jobs:
             rexglue-android-zandatsu-runtime.patch \
             rexglue-android-runtime-diagnostics.patch \
             rexglue-android-city-trace.patch \
-            rexglue-android-host-call-trace.patch; do
+            rexglue-android-host-call-trace.patch \
+            rexglue-android-null-xenos-frontend.patch; do
             git -C "$sdk" apply "$GITHUB_WORKSPACE/patches/$patch"
           done
 
