@@ -22,8 +22,6 @@ import android.view.WindowManager;
 import org.libsdl.app.SDLActivity;
 import java.io.File;
 import java.io.BufferedReader;
-import java.io.FileInputStream;
-import java.io.FileOutputStream;
 import java.io.FileReader;
 
 public final class MclaActivity extends SDLActivity {
@@ -78,17 +76,11 @@ public final class MclaActivity extends SDLActivity {
         applyLogEnvironment();
         applyPerformanceEnvironment();
         applyDriverDebugEnvironment();
-        File source = new File(getApplicationInfo().nativeLibraryDir, "librexgpu-xenos.so");
-        File target = new File(getFilesDir(), "librexgpu-xenos.so");
-        try (FileInputStream input = new FileInputStream(source);
-             FileOutputStream output = new FileOutputStream(target)) {
-            byte[] buffer = new byte[64 * 1024];
-            int count;
-            while ((count = input.read(buffer)) != -1) {
-                output.write(buffer, 0, count);
-            }
+        try {
+            Os.setenv("MCLA_NATIVE_LIBRARY_DIR", getApplicationInfo().nativeLibraryDir, true);
+            Os.setenv("MCLA_DRIVER_TEMP_DIR", getCacheDir().getAbsolutePath(), true);
         } catch (Exception e) {
-            Log.e(TAG, "Could not stage the Xenos Vulkan plugin", e);
+            Log.e(TAG, "Could not configure AdrenoTools library paths", e);
         }
         super.onCreate(state);
         if (mLayout != null) {

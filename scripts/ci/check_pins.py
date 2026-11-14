@@ -29,6 +29,7 @@ android_patches = [
     "rexglue-android-bionic-link.patch",
     "rexglue-android-driver-selection.patch",
     "rexglue-android-stereo-diagnostic.patch",
+    "rexglue-android-zandatsu-runtime.patch",
 ]
 
 build_doc = (root / "docs" / "android-build.md").read_text(encoding="utf-8", errors="replace")
@@ -71,6 +72,7 @@ known_hashes = {
     "rexglue-android-bionic-link.patch": "e3bf87a2847134ae9b92a0ac2299c6f86359646a234265cbd1e325eadbcb692a",
     "rexglue-android-driver-selection.patch": "d4fec822e4db5a27d0e905e5280c852a0a76002f8f9b8b71894ca166f3159fb5",
     "rexglue-android-stereo-diagnostic.patch": "c624ba301ee3d504a99c04bbd558451c91f79bba303091554c5764dd091096fc",
+    "rexglue-android-zandatsu-runtime.patch": "847d7401f29f4c4a834f3c126f04aa8bf74b5e8f190b25c29a8e92d4a4829722",
 }
 for name, expected in known_hashes.items():
     path = patch_dir / name

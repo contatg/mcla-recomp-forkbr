@@ -8,7 +8,11 @@ project(mcla LANGUAGES CXX)
 set(CMAKE_CXX_STANDARD 23)
 set(CMAKE_CXX_STANDARD_REQUIRED ON)
 
+set(REXGLUE_HOST_CODEGEN "" CACHE FILEPATH "Native ReXGlue executable used when cross-compiling")
 include(generated/rexglue.cmake)
+if(REXGLUE_HOST_CODEGEN)
+    set_property(TARGET rex::rexglue PROPERTY IMPORTED_LOCATION_RELEASE "${REXGLUE_HOST_CODEGEN}")
+endif()
 
 if(MINGW)
     # llvm-mingw (archive/fork-base/scripts/make_pc.ps1 -Toolchain mingw). The SDK is built the same

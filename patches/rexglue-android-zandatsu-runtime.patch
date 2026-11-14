@@ -1,0 +1,348 @@
+diff --git a/include/rex/graphics/vulkan/pipeline_cache.h b/include/rex/graphics/vulkan/pipeline_cache.h
+index 37cd672..3ace466 100644
+--- a/include/rex/graphics/vulkan/pipeline_cache.h
++++ b/include/rex/graphics/vulkan/pipeline_cache.h
+@@ -23,6 +23,7 @@
+ #include <mutex>
+ #include <queue>
+ #include <set>
++#include <shared_mutex>
+ #include <thread>
+ #include <unordered_map>
+ #include <utility>
+@@ -468,6 +469,9 @@ class VulkanPipelineCache {
+   // Created with the data from that file when the shader storage is first
+   // initialized; VK_NULL_HANDLE before that or if disabled.
+   VkPipelineCache vk_pipeline_cache_ = VK_NULL_HANDLE;
++#if REX_PLATFORM_ANDROID
++  std::shared_mutex vk_pipeline_cache_mutex_;
++#endif
+   std::filesystem::path vk_pipeline_cache_path_;
+   // Pipelines have been created through vk_pipeline_cache_ since it was last
+   // saved.
+diff --git a/include/rex/ui/vulkan/instance.h b/include/rex/ui/vulkan/instance.h
+index 2bd13ec..076acfe 100644
+--- a/include/rex/ui/vulkan/instance.h
++++ b/include/rex/ui/vulkan/instance.h
+@@ -25,6 +25,11 @@ namespace vulkan {
+ class VulkanInstance {
+  public:
+   static std::unique_ptr<VulkanInstance> Create(bool with_surface, bool try_enable_validation);
++#if REX_PLATFORM_ANDROID
++  static bool HasSelectedAndroidDriver();
++  static std::unique_ptr<VulkanInstance> Create(bool with_surface, bool try_enable_validation,
++                                                bool use_custom_driver);
++#endif
+ 
+   VulkanInstance(const VulkanInstance&) = delete;
+   VulkanInstance& operator=(const VulkanInstance&) = delete;
+diff --git a/include/rex/ui/vulkan/provider.h b/include/rex/ui/vulkan/provider.h
+index 3d603f5..3162fd3 100644
+--- a/include/rex/ui/vulkan/provider.h
++++ b/include/rex/ui/vulkan/provider.h
+@@ -40,6 +40,10 @@ class VulkanProvider : public GraphicsProvider {
+  private:
+   explicit VulkanProvider() = default;
+ 
++  static std::unique_ptr<VulkanProvider> CreateWithInstance(std::unique_ptr<VulkanInstance> instance,
++                                                           bool with_gpu_emulation,
++                                                           bool with_presentation);
++
+   std::unique_ptr<VulkanInstance> vulkan_instance_;
+ 
+   // Depends on the instance.
+diff --git a/src/core/threading_posix.cpp b/src/core/threading_posix.cpp
+index f134a21..35cdf79 100644
+--- a/src/core/threading_posix.cpp
++++ b/src/core/threading_posix.cpp
+@@ -310,12 +310,14 @@ class PosixConditionBase {
+     if (predicate()) {
+       executed = true;
+     } else {
++      ++waiting_count_;
+       if (timeout == std::chrono::milliseconds::max()) {
+         cond_.wait(lock, predicate);
+         executed = true;  // Did not time out;
+       } else {
+         executed = cond_.wait_for(lock, timeout, predicate);
+       }
++      --waiting_count_;
+     }
+     if (executed) {
+       post_execution();
+@@ -435,6 +437,7 @@ class PosixConditionBase {
+   inline virtual void post_execution() = 0;
+   std::condition_variable cond_;
+   std::mutex mutex_;
++  uint32_t waiting_count_ = 0;  // Protected by mutex_.
+ };
+ 
+ // There really is no native POSIX handle for a single wait/signal construct
+@@ -454,7 +457,13 @@ class PosixCondition<Event> : public PosixConditionBase {
+   bool Signal() override {
+     auto lock = std::unique_lock<std::mutex>(mutex_);
+     signal_ = true;
+-    cond_.notify_all();
++    if (waiting_count_) {
++      if (manual_reset_) {
++        cond_.notify_all();
++      } else {
++        cond_.notify_one();
++      }
++    }
+     return true;
+   }
+ 
+@@ -491,16 +500,21 @@ class PosixCondition<Semaphore> : public PosixConditionBase {
+       *out_previous_count = count_;
+     }
+     count_ += release_count;
+-    cond_.notify_all();
++    if (release_count && waiting_count_) {
++      if (release_count >= waiting_count_) {
++        cond_.notify_all();
++      } else {
++        for (uint32_t i = 0; i < release_count; ++i) {
++          cond_.notify_one();
++        }
++      }
++    }
+     return true;
+   }
+ 
+  private:
+   inline bool signaled() const override { return count_ > 0; }
+-  inline void post_execution() override {
+-    count_--;
+-    cond_.notify_all();
+-  }
++  inline void post_execution() override { --count_; }
+   uint32_t count_;
+   const uint32_t maximum_count_;
+ };
+diff --git a/src/graphics/vulkan/pipeline_cache.cpp b/src/graphics/vulkan/pipeline_cache.cpp
+index f6335f9..86b7204 100644
+--- a/src/graphics/vulkan/pipeline_cache.cpp
++++ b/src/graphics/vulkan/pipeline_cache.cpp
+@@ -3883,8 +3883,17 @@ bool VulkanPipelineCache::EnsurePipelineCreated(const PipelineCreationArguments&
+   const ui::vulkan::VulkanDevice::Functions& dfn = vulkan_device->functions();
+   const VkDevice device = vulkan_device->device();
+   VkPipeline pipeline;
+-  VkResult create_result = dfn.vkCreateGraphicsPipelines(device, vk_pipeline_cache_, 1,
+-                                                         &pipeline_create_info, nullptr, &pipeline);
++  VkResult create_result;
++  {
++#if REX_PLATFORM_ANDROID
++    std::shared_lock lock(vk_pipeline_cache_mutex_, std::defer_lock);
++    if (vk_pipeline_cache_ != VK_NULL_HANDLE) {
++      lock.lock();
++    }
++#endif
++    create_result = dfn.vkCreateGraphicsPipelines(device, vk_pipeline_cache_, 1,
++                                                  &pipeline_create_info, nullptr, &pipeline);
++  }
+   if (create_result != VK_SUCCESS) {
+     uint64_t ps_hash = creation_arguments.pixel_shader
+                            ? creation_arguments.pixel_shader->shader().ucode_data_hash()
+@@ -3989,8 +3998,8 @@ bool VulkanPipelineCache::AwaitAsyncPipelineCreation(void* handle, uint64_t time
+     return !pipeline->is_placeholder.load(std::memory_order_acquire) ||
+            pipeline->async_creation_failed.load(std::memory_order_acquire);
+   };
+-  if (created_or_failed()) {
+-    return true;
++  if (!timeout_us || created_or_failed()) {
++    return created_or_failed();
+   }
+   std::unique_lock<std::mutex> lock(creation_request_lock_);
+   return async_creation_done_cond_.wait_for(lock, std::chrono::microseconds(timeout_us),
+@@ -4073,6 +4082,11 @@ void VulkanPipelineCache::SaveVkPipelineCache() {
+   const ui::vulkan::VulkanDevice::Functions& dfn = vulkan_device->functions();
+   const VkDevice device = vulkan_device->device();
+   std::vector<uint8_t> pipeline_cache_data;
++#if REX_PLATFORM_ANDROID
++  // Some mobile drivers cannot export the cache while another thread compiles into it.
++  // Release this lock before writing the cache to disk.
++  std::unique_lock lock(vk_pipeline_cache_mutex_);
++#endif
+   // The cache may grow between getting the size and the data.
+   VkResult result = VK_INCOMPLETE;
+   for (uint32_t attempt = 0; attempt < 4 && result == VK_INCOMPLETE; ++attempt) {
+@@ -4097,6 +4111,9 @@ void VulkanPipelineCache::SaveVkPipelineCache() {
+     save_failed();
+     return;
+   }
++#if REX_PLATFORM_ANDROID
++  lock.unlock();
++#endif
+   // Written next to it, flushed to the disk and renamed, so a run ending
+   // during the write doesn't leave a partial file.
+   std::filesystem::path temporary_path = vk_pipeline_cache_path_;
+diff --git a/src/system/gpu_plugin_loader.cpp b/src/system/gpu_plugin_loader.cpp
+index 754fa13..03b2cfc 100644
+--- a/src/system/gpu_plugin_loader.cpp
++++ b/src/system/gpu_plugin_loader.cpp
+@@ -55,6 +55,10 @@ std::vector<platform::DynamicLibrary>& LoadedPlugins() {
+ }  // namespace
+ 
+ std::unique_ptr<IGraphicsSystem> LoadGpuPlugin(std::string_view name, std::string_view backend) {
++#if REX_PLATFORM_ANDROID
++  // Resolve the APK's installed library in the app linker namespace.
++  auto path = std::filesystem::path(PluginFileName(name));
++#else
+   auto path = rex::filesystem::GetExecutableFolder() / PluginFileName(name);
+   if (!std::filesystem::exists(path)) {
+     REXSYS_ERROR(
+@@ -63,6 +67,7 @@ std::unique_ptr<IGraphicsSystem> LoadGpuPlugin(std::string_view name, std::strin
+         name, path.string(), name);
+     return nullptr;
+   }
++#endif
+ 
+   platform::DynamicLibrary library;
+   if (!library.Load(path, platform::SymbolResolution::kImmediate)) {
+diff --git a/src/ui/vulkan/vulkan_device.cpp b/src/ui/vulkan/vulkan_device.cpp
+index 4918661..a80f3cd 100644
+--- a/src/ui/vulkan/vulkan_device.cpp
++++ b/src/ui/vulkan/vulkan_device.cpp
+@@ -927,6 +927,17 @@ std::unique_ptr<VulkanDevice> VulkanDevice::CreateIfSupported(
+     }
+   }
+ 
++#if REX_PLATFORM_ANDROID
++  // Older proprietary Mali drivers use the classic render-pass path.
++  if (device->properties_.dynamicRendering &&
++      device->properties_.driverID == VK_DRIVER_ID_ARM_PROPRIETARY &&
++      properties.driverVersion < VK_MAKE_VERSION(52, 0, 0)) {
++    device->properties_.dynamicRendering = false;
++    REXLOG_INFO("Vulkan: using classic render passes on Mali driver r{}p{}",
++                VK_VERSION_MAJOR(properties.driverVersion), VK_VERSION_MINOR(properties.driverVersion));
++  }
++#endif
++
+   if (ext_KHR_portability_subset) {
+     if (with_gpu_emulation) {
+       XE_UI_VULKAN_FEATURE_2(features_KHR_portability_subset, constantAlphaColorBlendFactors)
+diff --git a/src/ui/vulkan/vulkan_instance.cpp b/src/ui/vulkan/vulkan_instance.cpp
+index 13f3743..59cf39e 100644
+--- a/src/ui/vulkan/vulkan_instance.cpp
++++ b/src/ui/vulkan/vulkan_instance.cpp
+@@ -10,6 +10,7 @@
+  */
+ 
+ #include <sstream>
++#include <cstdlib>
+ #include <fstream>
+ #include <string>
+ #include <unordered_map>
+@@ -47,6 +48,11 @@ namespace ui {
+ namespace vulkan {
+ 
+ #if REX_PLATFORM_ANDROID
++bool VulkanInstance::HasSelectedAndroidDriver() {
++  return std::filesystem::is_regular_file(rex::filesystem::GetUserFolder() / "gpu-drivers" /
++                                          "selected.txt");
++}
++
+ static void* OpenSelectedAndroidDriver() {
+   const std::filesystem::path driver_dir = rex::filesystem::GetUserFolder() / "gpu-drivers";
+   std::ifstream selection(driver_dir / "selected.txt");
+@@ -66,13 +72,11 @@ static void* OpenSelectedAndroidDriver() {
+     REXLOG_WARN("Selected Android Vulkan driver is missing; using system Vulkan");
+     return nullptr;
+   }
+-  Dl_info self_info{};
+-  if (!dladdr(reinterpret_cast<void*>(&OpenSelectedAndroidDriver), &self_info) ||
+-      !self_info.dli_fname) {
++  const char* hook_path = std::getenv("MCLA_NATIVE_LIBRARY_DIR");
++  if (!hook_path || !*hook_path) {
+     REXLOG_WARN("Cannot locate Android Vulkan hook libraries; using system Vulkan");
+     return nullptr;
+   }
+-  const std::filesystem::path hook_dir = std::filesystem::path(self_info.dli_fname).parent_path();
+   void* tools_lib = dlopen("libadrenotools.so", RTLD_NOW | RTLD_LOCAL);
+   if (!tools_lib) {
+     REXLOG_WARN("Cannot load AdrenoTools: {}; using system Vulkan", dlerror());
+@@ -83,18 +87,20 @@ static void* OpenSelectedAndroidDriver() {
+   auto open = reinterpret_cast<OpenFn>(dlsym(tools_lib, "adrenotools_open_libvulkan"));
+   if (!open) {
+     REXLOG_WARN("AdrenoTools Vulkan entry point missing; using system Vulkan");
++    dlclose(tools_lib);
+     return nullptr;
+   }
+   constexpr int kCustomDriver = 1;
+-  const std::string hook_path = hook_dir.string();
+   const std::string driver_path = driver_dir.string() + "/";
+-  void* handle = open(RTLD_NOW, kCustomDriver, nullptr, hook_path.c_str(),
++  const char* temp_path = std::getenv("MCLA_DRIVER_TEMP_DIR");
++  void* handle = open(RTLD_NOW, kCustomDriver, temp_path, hook_path,
+                       driver_path.c_str(), driver_name.c_str(), nullptr, nullptr);
+   if (handle) {
+     REXLOG_INFO("Driver loader opened selected Vulkan library from {}; verify GPU and driver name",
+                 driver.string());
+   } else {
+     REXLOG_WARN("AdrenoTools rejected selected driver; using system Vulkan");
++    dlclose(tools_lib);
+   }
+   return handle;
+ }
+@@ -102,6 +108,14 @@ static void* OpenSelectedAndroidDriver() {
+ 
+ std::unique_ptr<VulkanInstance> VulkanInstance::Create(const bool with_surface,
+                                                        const bool try_enable_validation) {
++#if REX_PLATFORM_ANDROID
++  return Create(with_surface, try_enable_validation, false);
++}
++
++std::unique_ptr<VulkanInstance> VulkanInstance::Create(const bool with_surface,
++                                                       const bool try_enable_validation,
++                                                       const bool use_custom_driver) {
++#endif
+   std::unique_ptr<VulkanInstance> vulkan_instance(new VulkanInstance());
+ 
+   // Load the RenderDoc API if connected.
+@@ -159,7 +173,9 @@ std::unique_ptr<VulkanInstance> VulkanInstance::Create(const bool with_surface,
+   ifn.vkDestroyInstance =
+       PFN_vkDestroyInstance(ifn.vkGetInstanceProcAddr(nullptr, "vkDestroyInstance"));
+ #elif REX_PLATFORM_ANDROID
+-  if (void* custom_loader = OpenSelectedAndroidDriver()) {
++  if (use_custom_driver) {
++    void* custom_loader = OpenSelectedAndroidDriver();
++    if (!custom_loader) return nullptr;
+     vulkan_instance->loader_.Adopt(custom_loader);
+     loader_loaded = true;
+   } else {
+diff --git a/src/ui/vulkan/vulkan_provider.cpp b/src/ui/vulkan/vulkan_provider.cpp
+index 9eeb902..a7edd0e 100644
+--- a/src/ui/vulkan/vulkan_provider.cpp
++++ b/src/ui/vulkan/vulkan_provider.cpp
+@@ -46,13 +46,24 @@ namespace vulkan {
+ 
+ std::unique_ptr<VulkanProvider> VulkanProvider::Create(const bool with_gpu_emulation,
+                                                        const bool with_presentation) {
+-  std::unique_ptr<VulkanProvider> provider(new VulkanProvider());
+-
+-  provider->vulkan_instance_ =
+-      VulkanInstance::Create(with_presentation, REXCVAR_GET(vulkan_validation_enabled));
+-  if (!provider->vulkan_instance_) {
+-    return nullptr;
++  const bool validation = REXCVAR_GET(vulkan_validation_enabled);
++#if REX_PLATFORM_ANDROID
++  if (VulkanInstance::HasSelectedAndroidDriver()) {
++    auto provider = CreateWithInstance(VulkanInstance::Create(with_presentation, validation, true),
++                                       with_gpu_emulation, with_presentation);
++    if (provider) return provider;
++    REXLOG_WARN("Selected Vulkan driver failed initialization; retrying with system Vulkan");
+   }
++#endif
++  return CreateWithInstance(VulkanInstance::Create(with_presentation, validation), with_gpu_emulation,
++                            with_presentation);
++}
++
++std::unique_ptr<VulkanProvider> VulkanProvider::CreateWithInstance(
++    std::unique_ptr<VulkanInstance> instance, bool with_gpu_emulation, bool with_presentation) {
++  if (!instance) return nullptr;
++  std::unique_ptr<VulkanProvider> provider(new VulkanProvider());
++  provider->vulkan_instance_ = std::move(instance);
+ 
+   std::vector<VkPhysicalDevice> physical_devices;
+   provider->vulkan_instance_->EnumeratePhysicalDevices(physical_devices);

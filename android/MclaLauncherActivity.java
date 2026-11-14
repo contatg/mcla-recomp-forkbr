@@ -10,6 +10,7 @@ import android.graphics.Color;
 import android.graphics.Typeface;
 import android.graphics.drawable.GradientDrawable;
 import android.net.Uri;
+import android.os.Build;
 import android.os.Bundle;
 import android.os.Handler;
 import android.os.Looper;
@@ -25,14 +26,18 @@ import android.widget.LinearLayout;
 import android.widget.ProgressBar;
 import android.widget.ScrollView;
 import android.widget.TextView;
+import java.io.ByteArrayOutputStream;
 import java.io.File;
 import java.io.FileOutputStream;
 import java.io.InputStream;
 import java.io.FileInputStream;
+import java.io.OutputStream;
+import java.util.Enumeration;
 import java.util.HashMap;
 import java.util.Map;
 import java.util.zip.ZipEntry;
-import java.util.zip.ZipInputStream;
+import java.util.zip.ZipFile;
+import org.json.JSONObject;
 
 public final class MclaLauncherActivity extends Activity {
     private static final String TAG = "MCLA Import";
@@ -40,6 +45,8 @@ public final class MclaLauncherActivity extends Activity {
     private static final int PICK_DRIVER_ZIP = 2;
     private static final int PICK_SHADER_PACK = 3;
     private static final long MAX_DRIVER_BYTES = 128L * 1024 * 1024;
+    private static final long MAX_DRIVER_ZIP_BYTES = MAX_DRIVER_BYTES + 8L * 1024 * 1024;
+    private static final int MAX_DRIVER_METADATA_BYTES = 64 * 1024;
     private static final long MAX_SHADER_PACK_BYTES = 64L * 1024 * 1024;
     private static final String SHADER_PACK_NAME = "545407F8.shaderpack";
 
@@ -531,38 +538,27 @@ public final class MclaLauncherActivity extends Activity {
         String driverName = isMaliBuild ? "libvulkan_panfrost.so" : "libvulkan_freedreno.so";
         File part = new File(folder, driverName + ".partial");
         File target = new File(folder, driverName);
+        File archive = null;
         try {
+            if (Build.VERSION.SDK_INT < 28)
+                throw new Exception("Custom Vulkan drivers need Android 9 or newer.");
             if (!folder.isDirectory() && !folder.mkdirs())
                 throw new Exception("Could not create the driver folder.");
-            boolean found = false;
+            archive = File.createTempFile("vulkan-driver-", ".zip", getCacheDir());
             try (InputStream raw = getContentResolver().openInputStream(uri)) {
                 if (raw == null) throw new Exception("Could not open the ZIP.");
-                try (ZipInputStream zip = new ZipInputStream(raw)) {
-                    ZipEntry entry;
-                    while ((entry = zip.getNextEntry()) != null) {
-                        String name = entry.getName();
-                        if (entry.isDirectory() || name == null ||
-                                !(name.equals(driverName) || name.endsWith("/" + driverName) ||
-                                  (isMaliBuild && (name.equals("libvulkan_freedreno.so") ||
-                                  name.endsWith("/libvulkan_freedreno.so"))))) continue;
-                        if (found) throw new Exception("The ZIP contains more than one driver.");
-                        found = true;
-                        long copied = 0;
-                        byte[] buffer = new byte[64 * 1024];
-                        try (FileOutputStream output = new FileOutputStream(part)) {
-                            int count;
-                            while ((count = zip.read(buffer)) != -1) {
-                                copied += count;
-                                if (copied > MAX_DRIVER_BYTES)
-                                    throw new Exception("Driver exceeds 128 MiB.");
-                                output.write(buffer, 0, count);
-                            }
-                            output.getFD().sync();
-                        }
-                    }
+                try (FileOutputStream output = new FileOutputStream(archive)) {
+                    copyDriverBytes(raw, output, MAX_DRIVER_ZIP_BYTES);
                 }
             }
-            if (!found) throw new Exception("The ZIP does not contain " + driverName + ".");
+            try (ZipFile zip = new ZipFile(archive)) {
+                ZipEntry library = findDriverLibrary(zip, driverName, isMaliBuild);
+                try (InputStream input = zip.getInputStream(library);
+                     FileOutputStream output = new FileOutputStream(part)) {
+                    copyDriverBytes(input, output, MAX_DRIVER_BYTES);
+                    output.getFD().sync();
+                }
+            }
             validateArm64Library(part);
             if (!part.renameTo(target)) throw new Exception("Could not save the driver.");
             File selection = new File(folder, "selected.txt");
@@ -579,10 +575,59 @@ public final class MclaLauncherActivity extends Activity {
             mainHandler.post(() -> status.setText("Driver import failed: " + e.getMessage()));
         } finally {
             part.delete();
+            if (archive != null) archive.delete();
             mainHandler.post(() -> {
                 driverButton.setEnabled(true);
                 playButton.setEnabled(hasGameFiles());
             });
+        }
+    }
+
+    private static ZipEntry findDriverLibrary(ZipFile zip, String preferred, boolean mali)
+            throws Exception {
+        Map<String, ZipEntry> files = new HashMap<>();
+        Enumeration<? extends ZipEntry> entries = zip.entries();
+        while (entries.hasMoreElements()) {
+            ZipEntry entry = entries.nextElement();
+            if (entry.isDirectory()) continue;
+            String path = entry.getName();
+            String name = path.substring(path.lastIndexOf('/') + 1);
+            if (!name.equals("meta.json") && !name.endsWith(".so")) continue;
+            if (files.put(name, entry) != null)
+                throw new Exception("Duplicate driver ZIP entry: " + name);
+        }
+        ZipEntry metadata = files.get("meta.json");
+        if (metadata != null) {
+            ByteArrayOutputStream json = new ByteArrayOutputStream();
+            try (InputStream input = zip.getInputStream(metadata)) {
+                copyDriverBytes(input, json, MAX_DRIVER_METADATA_BYTES);
+            }
+            JSONObject manifest = new JSONObject(json.toString("UTF-8"));
+            int minApi = manifest.optInt("minApi", 0);
+            if (minApi > Build.VERSION.SDK_INT)
+                throw new Exception("This driver requires Android API " + minApi + ".");
+            String libraryName = manifest.optString("libraryName", "");
+            if (!libraryName.isEmpty()) {
+                if (!libraryName.matches("[A-Za-z0-9._-]+\\.so") || !files.containsKey(libraryName))
+                    throw new Exception("The driver declared in meta.json is missing or invalid.");
+                return files.get(libraryName);
+            }
+        }
+        ZipEntry library = files.get(preferred);
+        if (library == null && mali) library = files.get("libvulkan_freedreno.so");
+        if (library == null) throw new Exception("The ZIP does not contain " + preferred + ".");
+        return library;
+    }
+
+    private static void copyDriverBytes(InputStream input, OutputStream output, long limit)
+            throws Exception {
+        byte[] buffer = new byte[64 * 1024];
+        long copied = 0;
+        int count;
+        while ((count = input.read(buffer)) != -1) {
+            copied += count;
+            if (copied > limit) throw new Exception("A driver ZIP entry exceeds its size limit.");
+            output.write(buffer, 0, count);
         }
     }
 
