@@ -30,6 +30,10 @@ class MclaApp : public rex::ReXApp {
   bool ConstructRuntime(const rex::PathConfig& paths) override;
   void OnPreSetup(rex::RuntimeConfig& config) override;
   void OnPostSetup() override;
+#ifdef __ANDROID__
+  std::optional<rex::PathConfig> OnFinalizePaths(
+      const rex::PathConfig& defaults, std::function<void(rex::PathConfig)> resume) override;
+#endif
   void OnCreateDialogs(rex::ui::ImGuiDrawer* drawer) override;
   void OnShutdown() override;
   void OnPreLaunchModule() override;
@@ -57,6 +61,7 @@ class MclaApp : public rex::ReXApp {
  private:
 #ifdef __ANDROID__
   std::jthread diagnostics_thread_;
+  rex::system::IGraphicsSystem* render_v2_ = nullptr;
 #endif
   std::unique_ptr<rex::ui::ImGuiDialog> video_borders_;
   std::unique_ptr<rex::ui::ImGuiDialog> fps_counter_;

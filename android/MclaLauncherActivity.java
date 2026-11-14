@@ -251,6 +251,23 @@ public final class MclaLauncherActivity extends Activity {
 
         LinearLayout extrasCard = card(layout, "03  Extras", "Optional graphics assets and touch layout.");
 
+        android.widget.Switch render = new android.widget.Switch(this);
+        render.setText("Render: Nova / Antiga");
+        android.content.SharedPreferences renderSettings =
+                getSharedPreferences("renderer", MODE_PRIVATE);
+        render.setChecked(renderSettings.getBoolean("render_v2", true));
+        render.setShowText(true);
+        render.setTextOn("Nova");
+        render.setTextOff("Antiga");
+        render.setOnCheckedChangeListener((view, enabled) -> {
+            renderSettings.edit().putBoolean("render_v2", enabled).apply();
+            if (playButton != null) {
+                playButton.setText(enabled ? "Testar render nova" : "Play");
+                playButton.setEnabled(enabled || hasGameFiles());
+            }
+        });
+        extrasCard.addView(render);
+
         android.widget.Switch hostTrace = new android.widget.Switch(this);
         hostTrace.setText("Rastrear chamadas do host (próximo Play)");
         android.content.SharedPreferences diagnostics =
@@ -329,8 +346,8 @@ public final class MclaLauncherActivity extends Activity {
         }
 
         playButton = new Button(this);
-        playButton.setText("Play");
-        playButton.setEnabled(hasGameFiles());
+        playButton.setText(usesNewRenderer() ? "Testar render nova" : "Play");
+        playButton.setEnabled(usesNewRenderer() || hasGameFiles());
         playButton.setOnClickListener(view -> startGame());
         addAction(card(layout, "Launch", "Gamepad supported · touch controls experimental"),
                 playButton, true);
@@ -433,8 +450,12 @@ public final class MclaLauncherActivity extends Activity {
         return MclaGameImport.isReady(new File(getFilesDir(), "game"));
     }
 
+    private boolean usesNewRenderer() {
+        return getSharedPreferences("renderer", MODE_PRIVATE).getBoolean("render_v2", true);
+    }
+
     private void startGame() {
-        if (playPending || !hasGameFiles()) return;
+        if (playPending || (!usesNewRenderer() && !hasGameFiles())) return;
         playPending = true;
         playButton.setEnabled(false);
         setRequestedOrientation(ActivityInfo.SCREEN_ORIENTATION_LANDSCAPE);
@@ -610,7 +631,7 @@ public final class MclaLauncherActivity extends Activity {
             if (archive != null) archive.delete();
             mainHandler.post(() -> {
                 driverButton.setEnabled(true);
-                playButton.setEnabled(hasGameFiles());
+                playButton.setEnabled(usesNewRenderer() || hasGameFiles());
             });
         }
     }

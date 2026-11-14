@@ -74,7 +74,7 @@ fi
 for tool in javac java aapt2 apksigner zipalign keytool readelf; do
     command -v "$tool" >/dev/null || { echo "Missing Android packaging tool: $tool" >&2; exit 1; }
 done
-for lib in libmain.so; do
+for lib in libmain.so librexgpu-render-v2.so; do
     [ -f "$LIBS/$lib" ] || { echo "Build $lib first" >&2; exit 1; }
 done
 [ -f "$RUNTIME/librexgpu-xenos.so" ] || { echo "Build and install librexgpu-xenos.so first" >&2; exit 1; }
@@ -113,7 +113,7 @@ aapt2 link -o "$OUT/stage/apk/base.apk" -I "$PLATFORM" \
     --rename-manifest-package "$APPLICATION_ID" \
     --version-code "$VERSION_CODE" --version-name "$VERSION_NAME"
 
-cp "$LIBS/libmain.so" "$OUT/stage/jni/arm64-v8a/"
+cp "$LIBS/libmain.so" "$LIBS/librexgpu-render-v2.so" "$OUT/stage/jni/arm64-v8a/"
 cp "$RUNTIME/librexgpu-xenos.so" "$OUT/stage/jni/arm64-v8a/"
 cp "$RUNTIME/libSDL3.so" "$RUNTIME/librexruntime.so" "$OUT/stage/jni/arm64-v8a/"
 cp "$LIBCXX" "$OUT/stage/jni/arm64-v8a/libc++_shared.so"

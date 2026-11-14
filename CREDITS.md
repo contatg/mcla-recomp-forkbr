@@ -13,3 +13,10 @@ MCLA Recomp RV is an experimental Android ARM64 continuation of existing open-so
 - Other authors and projects whose work is included in the base fork or patches are credited in [THIRD-PARTY-NOTICES.md](THIRD-PARTY-NOTICES.md), source headers, and the base documentation.
 
 The Android changes and investigation are recorded in [docs/android-status.md](docs/android-status.md) and [docs/android-history.md](docs/android-history.md). The repository is distributed under the existing [GPL-3.0-or-later license](LICENSE), with the separate third-party notices kept intact. Game data and original game rights belong to their respective owners; this project is not affiliated with them.
+
+### Render nova no Android
+
+[Zandatsu](https://github.com/dfdx047/Zandatsu) serviu de referência para
+separar a escolha do backend da escolha do driver. O padrão gráfico da F1
+foi escrito para este projeto. As demais referências da arquitetura estão
+em [docs/RENDER_V2_ANALISE.md](docs/RENDER_V2_ANALISE.md).

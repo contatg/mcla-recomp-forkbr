@@ -866,7 +866,19 @@ void MclaApp::OnPreSetup(rex::RuntimeConfig& config) {
     backend = "vulkan";
   }
 #endif
-  if (backend != "any") {
+#if REX_PLATFORM_ANDROID
+  const char* selected_renderer = std::getenv("MCLA_ANDROID_RENDER");
+  if (!selected_renderer || std::string_view(selected_renderer) != "old") {
+    config.gpu_plugin = "render-v2";
+    config.graphics = rex::system::LoadGpuPlugin(config.gpu_plugin, "vulkan");
+    render_v2_ = config.graphics.get();
+    if (!render_v2_) {
+      REXLOG_ERROR("[build] backend=render-v2 result=plugin_load_failed fallback=xenos");
+      config.gpu_plugin = "xenos";
+    }
+  }
+#endif
+  if (!config.graphics && backend != "any") {
     config.graphics = rex::system::LoadGpuPlugin("xenos", backend);
     if (!config.graphics) {
       REXLOG_ERROR("could not load the xenos GPU plugin with backend '{}'; trying its default",
@@ -1361,7 +1373,7 @@ std::vector<AndroidThreadCpu> ReadAndroidThreadCpu() {
   return threads;
 }
 
-void SampleAndroidRuntime(std::stop_token stop) {
+void SampleAndroidRuntime(std::stop_token stop, const char* backend) {
   using namespace std::chrono;
   auto& data = rex::GetAndroidDiagnostics();
   const auto start = steady_clock::now();
@@ -1373,8 +1385,8 @@ void SampleAndroidRuntime(std::stop_token stop) {
   auto memory_deadline = start;
   const auto report_build = [&] {
     const char* version = std::getenv("MCLA_ANDROID_VERSION");
-    REXLOG_INFO("[build] version={} commit={} host_calls={} city_diagnostics={}",
-                version ? version : "unknown", MCLA_BUILD_COMMIT,
+    REXLOG_INFO("[build] version={} commit={} backend={} host_calls={} city_diagnostics={}",
+                version ? version : "unknown", MCLA_BUILD_COMMIT, backend,
                 rex::android_trace_host_calls.load(), data.trace_guest_waits.load());
   };
   const long ticks_per_sec = sysconf(_SC_CLK_TCK);
@@ -1497,11 +1509,23 @@ void SampleAndroidRuntime(std::stop_token stop) {
 }  // namespace
 #endif
 
+#if REX_PLATFORM_ANDROID
+std::optional<rex::PathConfig> MclaApp::OnFinalizePaths(
+    const rex::PathConfig& defaults, std::function<void(rex::PathConfig)> resume) {
+  if (!render_v2_) return rex::ReXApp::OnFinalizePaths(defaults, std::move(resume));
+  diagnostics_thread_ = std::jthread(SampleAndroidRuntime, "render-v2-f1");
+  if (XFAILED(render_v2_->SetupGuestGpu(nullptr, nullptr))) {
+    REXLOG_ERROR("[present] backend=render-v2 phase=F1 worker_start=failed");
+  }
+  return std::nullopt;
+}
+#endif
+
 void MclaApp::OnPostSetup() {
 #if REX_PLATFORM_ANDROID
   rex::GetAndroidDiagnostics().trace_guest_waits.store(REXCVAR_GET(mcla_city_diagnostics));
   rex::android_trace_host_calls.store(REXCVAR_GET(mcla_host_call_trace));
-  diagnostics_thread_ = std::jthread(SampleAndroidRuntime);
+  diagnostics_thread_ = std::jthread(SampleAndroidRuntime, "xenos");
 #endif
   ConfigureFrameTiming();
   FollowCursorSetting();
@@ -1633,6 +1657,7 @@ void MclaApp::OnCreateDialogs(rex::ui::ImGuiDrawer* drawer) {
 
 void MclaApp::OnShutdown() {
 #if REX_PLATFORM_ANDROID
+  if (render_v2_) render_v2_->Shutdown();
   if (diagnostics_thread_.joinable()) {
     diagnostics_thread_.request_stop();
     diagnostics_thread_.join();
