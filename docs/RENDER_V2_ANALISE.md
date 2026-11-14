@@ -69,3 +69,18 @@ pelas linhas `[stage]` e `[present]`. Envie o diagnóstico e anote até que
 ponto conseguiu avançar. Se a simulação continuar lenta, `[hostcall]` e
 `[guestwait2]` ajudam a separar espera por trabalho do guest de espera por
 dados ausentes que um resolve ou memexport normalmente produziria.
+
+## v0.1.57 — Play com imagem do jogo
+
+O botão **Play** volta a executar o backend Xenos completo. No Snapdragon
+680, o modo **Compatibilidade de shaders** usa o pipeline real em cada draw,
+com a compilação assíncrona desativada. O cache Vulkan existente continua
+disponível. Shaders que faltarem no cache podem causar pausas na primeira
+passagem. Desative a opção em Extras para comparar com o comportamento
+anterior. F1 e F2 continuam acessíveis separadamente em Extras.
+
+A hipótese de imagem incompleta por pipelines provisórios ainda precisa ser
+testada no aparelho. O log da v0.1.53 já mostrou desaceleração na cidade com
+fila de pipelines vazia, portanto a mudança não explica por si só a transição
+lenta. Teste pelo botão **Play**, confirme se há imagem no menu e na cidade
+e se a primeira corrida começa. Se houver falha, exporte o diagnóstico.

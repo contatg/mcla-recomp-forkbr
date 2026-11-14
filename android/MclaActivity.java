@@ -172,10 +172,14 @@ public final class MclaActivity extends SDLActivity {
         }
         try {
             Os.setenv("REX_LOG_FILE", new File(directory, "mcla.log").getAbsolutePath(), true);
-            Os.setenv("MCLA_ANDROID_RENDER",
-                    getIntent().getBooleanExtra("mcla_pattern_test", false) ? "pattern"
-                        : (getSharedPreferences("renderer", MODE_PRIVATE)
-                            .getBoolean("render_v2", true) ? "new" : "old"), true);
+            String render = getIntent().getStringExtra("mcla_render_mode");
+            boolean compatibility = MclaPerformanceProfile.isSnapdragon680()
+                    && getSharedPreferences("renderer", MODE_PRIVATE)
+                        .getBoolean("sd680_sync_shaders", true);
+            if (!"pattern".equals(render) && !"null".equals(render)) {
+                render = compatibility ? "game-sync" : "game";
+            }
+            Os.setenv("MCLA_ANDROID_RENDER", render, true);
             Os.setenv("MCLA_ANDROID_VERSION",
                     getPackageManager().getPackageInfo(getPackageName(), 0).versionName, true);
             Os.setenv("REX_MCLA_HOST_CALL_TRACE",

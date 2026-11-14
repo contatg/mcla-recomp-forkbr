@@ -867,9 +867,10 @@ void MclaApp::OnPreSetup(rex::RuntimeConfig& config) {
   }
 #endif
 #if REX_PLATFORM_ANDROID
-  const char* selected_renderer = std::getenv("MCLA_ANDROID_RENDER");
-  render_v2_pattern_ = selected_renderer && std::string_view(selected_renderer) == "pattern";
-  if (!selected_renderer || std::string_view(selected_renderer) != "old") {
+  const char* render_env = std::getenv("MCLA_ANDROID_RENDER");
+  const std::string_view selected_renderer = render_env ? render_env : "game";
+  render_v2_pattern_ = selected_renderer == "pattern";
+  if (render_v2_pattern_ || selected_renderer == "null") {
     config.gpu_plugin = "render-v2";
     config.graphics = rex::system::LoadGpuPlugin(config.gpu_plugin, "vulkan");
     render_v2_ = config.graphics.get();
@@ -907,7 +908,11 @@ void MclaApp::OnPreSetup(rex::RuntimeConfig& config) {
     rex::cvar::SetDefaultValue("mcla_fps_overlay", "false");
     rex::cvar::SetDefaultValue("vulkan_async_skip_incomplete_frames", "false");
     rex::cvar::SetDefaultValue("async_pipeline_wait_budget_ms", "1");
-    REXLOG_INFO("Adreno 610: presenting partial frames without the Vulkan UI layer");
+    if (selected_renderer == "game-sync") {
+      const bool applied = rex::cvar::SetFlagFromCommandLine("async_shader_compilation", "false");
+      REXLOG_INFO("[render] Vulkan shader compatibility applied={} async_shader_compilation={}",
+                  applied, rex::cvar::GetFlagByName("async_shader_compilation"));
+    }
     REXLOG_INFO("Adreno 610 compatibility: direct texture loads={}, dynamic rendering={}, aspect={}",
                 rex::cvar::GetFlagByName("texture_load_direct_unscaled"),
                 rex::cvar::GetFlagByName("vulkan_dynamic_rendering"),
@@ -1389,9 +1394,10 @@ void SampleAndroidRuntime(std::stop_token stop, const char* backend) {
   auto memory_deadline = start;
   const auto report_build = [&] {
     const char* version = std::getenv("MCLA_ANDROID_VERSION");
-    REXLOG_INFO("[build] version={} commit={} backend={} host_calls={} city_diagnostics={}",
+    REXLOG_INFO("[build] version={} commit={} backend={} host_calls={} city_diagnostics={} async_shaders={}",
                 version ? version : "unknown", MCLA_BUILD_COMMIT, backend,
-                rex::android_trace_host_calls.load(), data.trace_guest_waits.load());
+                rex::android_trace_host_calls.load(), data.trace_guest_waits.load(),
+                rex::cvar::GetFlagByName("async_shader_compilation"));
   };
   const long ticks_per_sec = sysconf(_SC_CLK_TCK);
   uint64_t previous_bytes = 0, previous_reads = 0, previous_read_ns = 0;

@@ -251,21 +251,25 @@ public final class MclaLauncherActivity extends Activity {
 
         LinearLayout extrasCard = card(layout, "03  Extras", "Optional graphics assets and touch layout.");
 
-        android.widget.Switch render = new android.widget.Switch(this);
-        render.setText("Render: Nova / Antiga");
-        android.content.SharedPreferences renderSettings =
-                getSharedPreferences("renderer", MODE_PRIVATE);
-        render.setChecked(renderSettings.getBoolean("render_v2", true));
-        render.setShowText(true);
-        render.setTextOn("Nova");
-        render.setTextOff("Antiga");
-        render.setOnCheckedChangeListener((view, enabled) ->
-                renderSettings.edit().putBoolean("render_v2", enabled).apply());
-        extrasCard.addView(render);
+        if (MclaPerformanceProfile.isSnapdragon680()) {
+            android.widget.Switch compatibility = new android.widget.Switch(this);
+            compatibility.setText("Compatibilidade de shaders (Snapdragon 680)");
+            android.content.SharedPreferences renderSettings =
+                    getSharedPreferences("renderer", MODE_PRIVATE);
+            compatibility.setChecked(renderSettings.getBoolean("sd680_sync_shaders", true));
+            compatibility.setOnCheckedChangeListener((view, enabled) ->
+                    renderSettings.edit().putBoolean("sd680_sync_shaders", enabled).apply());
+            extrasCard.addView(compatibility);
+        }
+
         Button pattern = new Button(this);
         pattern.setText("Padrão de teste da render nova (F1)");
-        pattern.setOnClickListener(view -> launch(false));
+        pattern.setOnClickListener(view -> launch("pattern"));
         addAction(extrasCard, pattern, false);
+        Button nullRender = new Button(this);
+        nullRender.setText("Diagnóstico da render nova (F2)");
+        nullRender.setOnClickListener(view -> launch("null"));
+        addAction(extrasCard, nullRender, false);
 
         android.widget.Switch hostTrace = new android.widget.Switch(this);
         hostTrace.setText("Rastrear chamadas do host (próximo Play)");
@@ -449,15 +453,15 @@ public final class MclaLauncherActivity extends Activity {
         return MclaGameImport.isReady(new File(getFilesDir(), "game"));
     }
 
-    private boolean patternPending;
+    private String pendingRender;
 
     private void startGame() {
-        launch(true);
+        launch("game");
     }
 
-    private void launch(boolean game) {
-        if (playPending || (game && !hasGameFiles())) return;
-        patternPending = !game;
+    private void launch(String render) {
+        if (playPending || (!"pattern".equals(render) && !hasGameFiles())) return;
+        pendingRender = render;
         playPending = true;
         playButton.setEnabled(false);
         setRequestedOrientation(ActivityInfo.SCREEN_ORIENTATION_LANDSCAPE);
@@ -477,7 +481,7 @@ public final class MclaLauncherActivity extends Activity {
     private void openGame() {
         playPending = false;
         Intent launch = new Intent(this, MclaActivity.class);
-        launch.putExtra("mcla_pattern_test", patternPending);
+        launch.putExtra("mcla_render_mode", pendingRender);
         startActivity(launch);
         finish();
     }
