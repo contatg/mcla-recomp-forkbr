@@ -7,6 +7,7 @@ MCLA Recomp RV is an experimental Android ARM64 continuation of existing open-so
 - [ReXGlue SDK](https://github.com/rexglue/rexglue-sdk) and its contributors: static recompilation runtime and Xbox 360 graphics/audio compatibility layer. The Android patch is based on SDK commit `f5337cdc947ff6d4c4196737e2c807a48f2a1fc2`.
 - [SDL3](https://github.com/libsdl-org/SDL): Android activity, window, input and audio integration used by the port.
 - [AdrenoTools](https://github.com/bylaws/libadrenotools) and `liblinkernsbypass`: optional loading of a user-selected Vulkan driver. Their BSD-2-Clause notice is included in [THIRD-PARTY-NOTICES.md](THIRD-PARTY-NOTICES.md). No Turnip driver is part of the source repository or APK.
+- [Zandatsu](https://github.com/dfdx047/Zandatsu) by dfdx047 and contributors: reference for the semaphore wake policy and Vulkan pipeline-cache synchronization. The older proprietary Mali dynamic-rendering workaround follows Zandatsu's adaptation of the ARMSX2 driver profile.
 - [Black-Android](https://github.com/RanggaCasper/Black-Android): design reference for an Android native port. Its renderer was not copied into this project.
 - [Def-Jam-Android-Native-Port](https://github.com/contatg/Def-Jam-Android-Native-Port): public documentation reference. Its private implementation was not used.
 - Other authors and projects whose work is included in the base fork or patches are credited in [THIRD-PARTY-NOTICES.md](THIRD-PARTY-NOTICES.md), source headers, and the base documentation.

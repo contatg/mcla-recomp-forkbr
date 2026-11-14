@@ -1,17 +1,18 @@
 diff --git a/include/rex/ui/presenter.h b/include/rex/ui/presenter.h
+index 0effdac..9d89865 100644
 --- a/include/rex/ui/presenter.h
 +++ b/include/rex/ui/presenter.h
-@@ -183,6 +183,27 @@
+@@ -183,6 +183,28 @@ struct RawImage {
  // only to the UI thread.
  class Presenter {
   public:
 +#if REX_PLATFORM_ANDROID
-+  // Completed host presents, not UI paints or guest swaps. These timestamps
-+  // do not measure when SurfaceFlinger actually displays a buffer.
++  // Successful host presents of new guest images, before Android display scanout.
 +  std::vector<uint64_t> GetRecentPresentationTimes() const {
 +    std::lock_guard<std::mutex> lock(presentation_times_mutex_);
 +    std::vector<uint64_t> times;
 +    const size_t count = std::min(presentation_times_count_, presentation_times_.size());
++    times.reserve(count);
 +    for (size_t i = 0; i < count; ++i) {
 +      times.push_back(presentation_times_[(presentation_times_count_ - count + i) %
 +                                         presentation_times_.size()]);
@@ -23,6 +24,7 @@ diff --git a/include/rex/ui/presenter.h b/include/rex/ui/presenter.h
 +  mutable std::mutex presentation_times_mutex_;
 +  std::array<uint64_t, 256> presentation_times_{};
 +  size_t presentation_times_count_ = 0;
++  uint64_t last_presented_refresh_number_ = 0;
 +
 + public:
 +#endif
@@ -30,17 +32,21 @@ diff --git a/include/rex/ui/presenter.h b/include/rex/ui/presenter.h
    // is false, such as when the guest output is refreshed by the UI thread.
    using HostGpuLossCallback =
 diff --git a/src/ui/presenter.cpp b/src/ui/presenter.cpp
+index 5953d2e..e36247a 100644
 --- a/src/ui/presenter.cpp
 +++ b/src/ui/presenter.cpp
-@@ -2091,6 +2091,13 @@
+@@ -2091,6 +2091,16 @@ Presenter::PaintResult Presenter::PaintAndPresent(bool execute_ui_drawers) {
      }
    }
    PaintResult result = PaintAndPresentImpl(execute_ui_drawers);
 +#if REX_PLATFORM_ANDROID
 +  if (result == PaintResult::kPresented || result == PaintResult::kPresentedSuboptimal) {
-+    const uint64_t now = PresentLog::Now();
++    const uint64_t refresh = last_consumed_refresh_number_.load(std::memory_order_relaxed);
 +    std::lock_guard<std::mutex> lock(presentation_times_mutex_);
-+    presentation_times_[presentation_times_count_++ % presentation_times_.size()] = now;
++    if (refresh > last_presented_refresh_number_) {
++      last_presented_refresh_number_ = refresh;
++      presentation_times_[presentation_times_count_++ % presentation_times_.size()] = PresentLog::Now();
++    }
 +  }
 +#endif
    if (log_present) {

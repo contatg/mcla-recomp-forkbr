@@ -8,6 +8,7 @@
 #include <cstdint>
 #include <chrono>
 #include <algorithm>
+#include <atomic>
 #include <cstdio>
 #include <cstdlib>
 #include <cstring>
@@ -47,6 +48,17 @@
 
 #if defined(__ANDROID__)
 #include <android/log.h>
+#include <condition_variable>
+#include <cerrno>
+#include <csignal>
+#include <dlfcn.h>
+#include <sys/syscall.h>
+#include <ucontext.h>
+#include <mutex>
+#include <sstream>
+#include <unordered_map>
+#include <unistd.h>
+#include <rex/android_diagnostics.h>
 #endif
 
 #include <rex/platform.h>
@@ -58,10 +70,14 @@
 
 #ifdef __ANDROID__
 REXCVAR_DECLARE(int32_t, mcla_fps);  // Defined in frame_timing.cpp.
+REXCVAR_DEFINE_BOOL(mcla_city_diagnostics, true, "MCLA",
+                    "Sample guest worker PCs and long guest synchronization waits on Android");
+REXCVAR_DEFINE_BOOL(mcla_adreno_610_compatibility, false, "MCLA",
+                    "Use the conservative Vulkan texture and render pass paths on Adreno 610");
 REXCVAR_DEFINE_BOOL(mcla_fps_overlay, true, "MCLA",
-                    "Show successful host-present FPS (not guest swaps or display scanout)");
+                    "Show game-update FPS and frame time");
 REXCVAR_DEFINE_BOOL(mcla_fps_log, true, "MCLA",
-                    "Log host-present FPS and interval percentiles every five seconds");
+                    "Log game updates and new guest frames presented every five seconds");
 #endif
 
 REXCVAR_DEFINE_STRING(mcla_gpu_backend, "any", "MCLA",
@@ -115,6 +131,9 @@ bool MclaPrepareShadersIsRequested();  // src/shader_prepare.cpp
 void MclaShaderStorageAfterPreload(rex::Runtime* runtime);
 void MclaMigrateAntiAliasing();  // src/perf_options.cpp
 void MclaApplyPreset();  // src/perf_options.cpp
+#if REX_PLATFORM_ANDROID
+void MclaApplyAndroidPerformanceProfile();
+#endif
 void MclaApplyGraphicsFixDefaults(bool vulkan);  // src/perf_options.cpp
 
 #ifdef _WIN32
@@ -863,6 +882,24 @@ void MclaApp::OnPreSetup(rex::RuntimeConfig& config) {
   ApplyPcDefaults();
   MclaMigrateAntiAliasing();
   MclaApplyPreset();
+#if REX_PLATFORM_ANDROID
+  MclaApplyAndroidPerformanceProfile();
+  if (REXCVAR_GET(mcla_adreno_610_compatibility)) {
+    rex::cvar::SetDefaultValue("texture_load_direct_unscaled", "false");
+    rex::cvar::SetFlagFromCommandLine("vulkan_pipeline_creation_threads", "2");
+    rex::cvar::SetDefaultValue("vulkan_dynamic_rendering", "false");
+    rex::cvar::SetDefaultValue("mcla_aspect_ratio", "16:9");
+    rex::cvar::SetDefaultValue("present_ui_overlay", "false");
+    rex::cvar::SetDefaultValue("mcla_fps_overlay", "false");
+    rex::cvar::SetDefaultValue("vulkan_async_skip_incomplete_frames", "false");
+    rex::cvar::SetDefaultValue("async_pipeline_wait_budget_ms", "1");
+    REXLOG_INFO("Adreno 610: presenting partial frames without the Vulkan UI layer");
+    REXLOG_INFO("Adreno 610 compatibility: direct texture loads={}, dynamic rendering={}, aspect={}",
+                rex::cvar::GetFlagByName("texture_load_direct_unscaled"),
+                rex::cvar::GetFlagByName("vulkan_dynamic_rendering"),
+                rex::cvar::GetFlagByName("mcla_aspect_ratio"));
+  }
+#endif
 #ifdef _WIN32
   // The GPU the game chose (ChooseGpu) is the one the SDK takes, whatever the API: d3d12_adapter
   // for Direct3D 12, vulkan_device for Vulkan (Automatic's or the player's), whose own choice
@@ -1194,7 +1231,268 @@ void MclaApp::OnGuestThreadExit(rex::system::XThread* thread) {
   MclaPumpWakeShutdownBegins();
 }
 
+#if REX_PLATFORM_ANDROID
+extern uint32_t MclaGuestFunctionForHostPc(uintptr_t host_pc);
+
+namespace {
+std::atomic<int> hot_guest_target{0};
+std::atomic<uintptr_t> hot_guest_pc{0};
+std::atomic<int> hot_guest_requested{0};
+static_assert(std::atomic<int>::is_always_lock_free);
+static_assert(std::atomic<uintptr_t>::is_always_lock_free);
+
+void CaptureHotGuestPc(int, siginfo_t*, void* context) {
+#if defined(__aarch64__)
+  const auto* cpu = static_cast<const ucontext_t*>(context);
+  const int tid = gettid();
+  if (hot_guest_requested.load(std::memory_order_relaxed) == tid) {
+    hot_guest_pc.store(cpu->uc_mcontext.pc, std::memory_order_relaxed);
+    hot_guest_requested.store(0, std::memory_order_release);
+  }
+#endif
+}
+
+int InstallHotGuestSampler() {
+#if defined(__aarch64__)
+  const int signal = SIGRTMAX - 3;
+  struct sigaction previous {};
+  if (sigaction(signal, nullptr, &previous) != 0 || previous.sa_handler != SIG_DFL) return 0;
+  struct sigaction action {};
+  action.sa_sigaction = CaptureHotGuestPc;
+  action.sa_flags = SA_SIGINFO | SA_RESTART;
+  sigemptyset(&action.sa_mask);
+  if (sigaction(signal, &action, nullptr) == 0) return signal;
+#endif
+  return 0;
+}
+
+void SampleHotGuest(std::stop_token stop) {
+  using namespace std::chrono;
+  const int signal = InstallHotGuestSampler();
+  if (!signal) {
+    REXLOG_INFO("[hotguest] status=sampler_unavailable");
+    return;
+  }
+  Dl_info game_module{};
+  dladdr(reinterpret_cast<const void*>(&MclaGuestFunctionForHostPc), &game_module);
+  std::unordered_map<uint32_t, unsigned> histogram;
+  unsigned samples = 0;
+  int previous_target = 0;
+  auto deadline = steady_clock::now() + seconds(5);
+  while (!stop.stop_requested()) {
+    const int target = hot_guest_target.load(std::memory_order_relaxed);
+    if (target != previous_target) {
+      histogram.clear();
+      samples = 0;
+      previous_target = target;
+      hot_guest_requested.store(0, std::memory_order_relaxed);
+      hot_guest_pc.exchange(0);
+      deadline = steady_clock::now() + seconds(5);
+    }
+    if (target) {
+      const auto pc = hot_guest_pc.exchange(0);
+      if (pc) {
+        Dl_info module{};
+        const uint32_t fn = dladdr(reinterpret_cast<const void*>(pc), &module) &&
+                                    module.dli_fbase == game_module.dli_fbase
+                                ? MclaGuestFunctionForHostPc(pc)
+                                : 0;
+        ++histogram[fn];
+        ++samples;
+      }
+      if (!hot_guest_requested.load(std::memory_order_acquire)) {
+        hot_guest_requested.store(target, std::memory_order_relaxed);
+        if (syscall(SYS_tgkill, getpid(), target, signal) != 0) {
+          hot_guest_requested.store(0, std::memory_order_relaxed);
+          if (errno == ESRCH) {
+            int expired = target;
+            hot_guest_target.compare_exchange_strong(expired, 0);
+          }
+        }
+      }
+    }
+    if (steady_clock::now() >= deadline) {
+      std::vector<std::pair<uint32_t, unsigned>> top(histogram.begin(), histogram.end());
+      const auto count = std::min<size_t>(10, top.size());
+      std::partial_sort(top.begin(), top.begin() + count, top.end(),
+                        [](const auto& a, const auto& b) { return a.second > b.second; });
+      for (size_t i = 0; i < count; ++i) {
+        const auto [fn, hits] = top[i];
+        const auto name = fn ? fmt::format("sub_{:08X}", fn) : "outside_guest_code";
+        REXLOG_INFO("[hotguest] fn=0x{:08X} name={} pct={:.1f} tid={} samples={}",
+                    fn, name, 100.0 * hits / samples, target, samples);
+      }
+      histogram.clear();
+      samples = 0;
+      deadline = steady_clock::now() + seconds(5);
+    }
+    std::this_thread::sleep_for(milliseconds(10));
+  }
+  // Leave the handler installed until process exit for any previously queued signal.
+}
+
+struct AndroidThreadCpu {
+  int tid;
+  uint64_t ticks;
+  std::string name;
+};
+
+std::vector<AndroidThreadCpu> ReadAndroidThreadCpu() {
+  std::vector<AndroidThreadCpu> threads;
+  std::error_code error;
+  for (std::filesystem::directory_iterator it("/proc/self/task", error), end;
+       !error && it != end; it.increment(error)) {
+    std::ifstream stat(it->path() / "stat");
+    std::string line;
+    if (!std::getline(stat, line)) continue;
+    const auto first = line.find('(');
+    const auto last = line.rfind(')');
+    if (first == std::string::npos || last <= first || last + 2 >= line.size()) continue;
+    std::istringstream fields(line.substr(last + 2));
+    std::string field;
+    for (int number = 3; number < 14; ++number) fields >> field;
+    int tid = 0;
+    uint64_t user = 0, system = 0;
+    if (std::sscanf(line.c_str(), "%d", &tid) == 1 && fields >> user >> system) {
+      threads.push_back({tid, user + system, line.substr(first + 1, last - first - 1)});
+    }
+  }
+  return threads;
+}
+
+void SampleAndroidRuntime(std::stop_token stop) {
+  using namespace std::chrono;
+  auto& data = rex::GetAndroidDiagnostics();
+  const auto start = steady_clock::now();
+  auto last = start;
+  auto prev_threads = ReadAndroidThreadCpu();
+  std::jthread hot_guest_thread;
+  if (data.trace_guest_waits.load()) hot_guest_thread = std::jthread(SampleHotGuest);
+  uint64_t previous_updates = 0;
+  auto memory_deadline = start + seconds(5);
+  const long ticks_per_sec = sysconf(_SC_CLK_TCK);
+  uint64_t previous_bytes = 0, previous_reads = 0, previous_read_ns = 0;
+  constexpr auto wait_count = unsigned(rex::AndroidWait::kCount);
+  uint64_t previous_wait[wait_count]{};
+  const char* wait_names[wait_count] = {"event", "io", "gpu", "write_watch"};
+  std::mutex mutex;
+  std::condition_variable_any timer;
+  std::unique_lock lock(mutex);
+  while (!stop.stop_requested()) {
+    timer.wait_until(lock, stop, last + seconds(1), [] { return false; });
+    if (stop.stop_requested()) break;
+    const auto now = steady_clock::now();
+    const double seconds_elapsed = duration<double>(now - last).count();
+    last = now;
+
+    REXLOG_INFO("[stage] t={}s guest_frames={} presented={} pipelines_pending={} "
+                "pipelines_created={} last_vk_wait={} guest_updates={}",
+                duration_cast<seconds>(now - start).count(), data.frames.load(),
+                data.presented.load(),
+                data.pipelines_pending.load() + data.pipelines_preloading.load(),
+                data.pipelines_created.load(), data.last_vk_wait.load(), data.guest_updates.load());
+
+    auto threads = ReadAndroidThreadCpu();
+    std::unordered_map<int, uint64_t> previous_ticks;
+    for (const auto& entry : prev_threads) previous_ticks.emplace(entry.tid, entry.ticks);
+    std::vector<std::pair<uint64_t, const AndroidThreadCpu*>> top;
+    for (const auto& entry : threads) {
+      auto old = previous_ticks.find(entry.tid);
+      if (old != previous_ticks.end() && entry.ticks >= old->second) {
+        top.emplace_back(entry.ticks - old->second, &entry);
+      }
+    }
+    const auto count = std::min<size_t>(5, top.size());
+    std::partial_sort(top.begin(), top.begin() + count, top.end(),
+                      [](const auto& a, const auto& b) { return a.first > b.first; });
+    const auto guest = data.guest_tid.load();
+    const auto updates = data.guest_updates.load();
+    if (hot_guest_thread.joinable()) {
+      int hottest_worker = 0;
+      uint64_t hottest_ticks = 0;
+      const bool slow_updates = updates - previous_updates < 10;
+      const bool has_waited = data.wait_object.load() != 0;
+      if (slow_updates && has_waited && guest) {
+        for (size_t i = 0; i < top.size(); ++i) {
+          const auto& [ticks, entry] = top[i];
+          if (ticks > hottest_ticks && entry->tid != guest && entry->name.starts_with("XThread")) {
+            hottest_worker = entry->tid;
+            hottest_ticks = ticks;
+          }
+        }
+      }
+      hot_guest_target.store(hottest_worker, std::memory_order_relaxed);
+    }
+    previous_updates = updates;
+    std::string cpu;
+    if (ticks_per_sec > 0) {
+      for (size_t i = 0; i < count; ++i) {
+        const auto& [ticks, entry] = top[i];
+        cpu += fmt::format(" {}={} cpu%={:.1f}", entry->name, entry->tid,
+                           100.0 * ticks / (ticks_per_sec * seconds_elapsed));
+      }
+    }
+    REXLOG_INFO("[threads]{}", cpu.empty() ? " unavailable" : cpu);
+    prev_threads = std::move(threads);
+
+    const auto bytes = data.read_bytes.load();
+    const auto reads = data.read_count.load();
+    const auto read_ns = data.read_ns.load();
+    const auto read_delta = reads - previous_reads;
+    REXLOG_INFO("[io] bytes={} reads={} avg_read_ms={:.3f}",
+                bytes - previous_bytes, read_delta,
+                read_delta ? double(read_ns - previous_read_ns) / read_delta / 1e6 : 0.0);
+    previous_bytes = bytes;
+    previous_reads = reads;
+    previous_read_ns = read_ns;
+
+    std::string waits;
+    for (unsigned i = 0; i < wait_count; ++i) {
+      const auto sequence = data.wait_sequence[i].load();
+      const auto active = data.active_since[i].load();
+      auto total = data.wait_ns[i].load();
+      const auto current = rex::AndroidDiagnosticNow();
+      if ((sequence & 1) || sequence != data.wait_sequence[i].load()) {
+        total = previous_wait[i];
+      } else if (active && current >= active) {
+        total += current - active;
+      }
+      const auto delta = total >= previous_wait[i] ? total - previous_wait[i] : 0;
+      previous_wait[i] = total;
+      waits += fmt::format(" {}_ms={:.3f}", wait_names[i], double(delta) / 1e6);
+    }
+    REXLOG_INFO("[guestwait] tid={}{}", data.guest_tid.load(), waits);
+    const auto waiting_since = data.wait_started_ns.load();
+    const auto object = data.wait_object.load();
+    const auto stamp = rex::AndroidDiagnosticNow();
+    if (waiting_since && stamp - waiting_since >= 100000000 &&
+        data.wait_started_ns.load() == waiting_since) {
+      REXLOG_INFO("[guestwait2] obj=0x{:08X} type={} waiter={} signaler=0 ms={:.3f} result=pending",
+                  uint32_t(object), unsigned(object >> 32), guest,
+                  double(stamp - waiting_since) / 1e6);
+    }
+    if (now >= memory_deadline) {
+      std::ifstream status("/proc/self/status");
+      std::string line;
+      long rss_kib = -1;
+      while (std::getline(status, line)) {
+        if (std::sscanf(line.c_str(), "VmRSS: %ld kB", &rss_kib) == 1) break;
+      }
+      REXLOG_INFO("[mem] rss_kib={} render_targets={} render_target_bytes={}", rss_kib,
+                  data.render_target_count.load(), data.render_target_bytes.load());
+      memory_deadline = now + seconds(5);
+    }
+    rex::FlushLogging();
+  }
+}
+}  // namespace
+#endif
+
 void MclaApp::OnPostSetup() {
+#if REX_PLATFORM_ANDROID
+  rex::GetAndroidDiagnostics().trace_guest_waits.store(REXCVAR_GET(mcla_city_diagnostics));
+  diagnostics_thread_ = std::jthread(SampleAndroidRuntime);
+#endif
   ConfigureFrameTiming();
   FollowCursorSetting();
 
@@ -1209,72 +1507,78 @@ void MclaApp::OnPostSetup() {
   }
 }
 
+#ifdef __ANDROID__
+void MclaLogAndroidFps() {
+  if (!REXCVAR_GET(mcla_fps_log)) return;
+  using namespace std::chrono;
+  static std::atomic<uint64_t> last_log_ns{0};
+  const auto now = steady_clock::now();
+  const uint64_t now_ns = duration_cast<nanoseconds>(now.time_since_epoch()).count();
+  uint64_t previous = last_log_ns.load(std::memory_order_relaxed);
+  if (now_ns < previous || now_ns - previous < 5'000'000'000 ||
+      !last_log_ns.compare_exchange_strong(previous, now_ns, std::memory_order_relaxed)) return;
+
+  auto* runtime = rex::Runtime::instance();
+  auto* graphics = runtime ? runtime->graphics_system() : nullptr;
+  auto* presenter = graphics ? graphics->presenter() : nullptr;
+  if (!presenter) return;
+
+  const auto game = mcla::GetGameUpdateStats();
+  auto times = presenter->GetRecentPresentationTimes();
+  const uint64_t cutoff = now_ns - std::min(now_ns, uint64_t(2'000'000'000));
+  times.erase(times.begin(), std::lower_bound(times.begin(), times.end(), cutoff));
+  double fps = 0, p50_ms = 0, p95_ms = 0;
+  if (times.size() >= 2 && times.back() > times.front() &&
+      times.back() >= now_ns - std::min(now_ns, uint64_t(1'000'000'000))) {
+    fps = double(times.size() - 1) * 1e9 / double(times.back() - times.front());
+    std::vector<double> intervals;
+    intervals.reserve(times.size() - 1);
+    for (size_t i = 1; i < times.size(); ++i) {
+      intervals.push_back(double(times[i] - times[i - 1]) / 1e6);
+    }
+    std::sort(intervals.begin(), intervals.end());
+    p50_ms = intervals[(intervals.size() - 1) / 2];
+    p95_ms = intervals[(intervals.size() * 95 + 99) / 100 - 1];
+  }
+  REXLOG_INFO("host presentation (recent 2s): {:.2f} FPS, p50 {:.2f} ms, p95 {:.2f} ms; "
+              "{} samples of new guest frames; "
+              "game updates: {:.2f} FPS, p95 {:.2f} ms",
+              fps, p50_ms, p95_ms, times.size(), game.fps, game.p95_ms);
+}
+#endif
+
 namespace {
 
 #ifdef __ANDROID__
 class FpsCounter final : public rex::ui::ImGuiDialog {
  public:
   explicit FpsCounter(rex::ui::ImGuiDrawer* drawer) : ImGuiDialog(drawer) {}
-  // OnDraw samples the presenter and writes the periodic log. Without UI
-  // repaints neither happens if the guest presents off the UI thread.
-  bool RepaintsContinuously() const override {
-    return REXCVAR_GET(mcla_fps_overlay) || REXCVAR_GET(mcla_fps_log);
-  }
+  bool RepaintsContinuously() const override { return REXCVAR_GET(mcla_fps_overlay); }
 
  protected:
   void OnDraw(ImGuiIO&) override {
-    const bool overlay = REXCVAR_GET(mcla_fps_overlay);
-    const bool logging = REXCVAR_GET(mcla_fps_log);
-    if (!overlay && !logging) return;
+    if (!REXCVAR_GET(mcla_fps_overlay)) return;
     const auto now = std::chrono::steady_clock::now();
     if (now - sampled_ >= std::chrono::milliseconds(500)) {
       sampled_ = now;
-      auto* runtime = rex::Runtime::instance();
-      auto* graphics = runtime ? runtime->graphics_system() : nullptr;
-      auto* presenter = graphics ? graphics->presenter() : nullptr;
-      if (!presenter) return;
-      auto times = presenter->GetRecentPresentationTimes();
-      const uint64_t now_ns = std::chrono::duration_cast<std::chrono::nanoseconds>(
-          now.time_since_epoch()).count();
-      const uint64_t cutoff = now_ns > 2'000'000'000 ? now_ns - 2'000'000'000 : 0;
-      times.erase(times.begin(), std::lower_bound(times.begin(), times.end(), cutoff));
-      fps_ = p50_ = p95_ = 0;
-      if (times.size() >= 2 && times.back() > times.front()) {
-        fps_ = double(times.size() - 1) * 1e9 / double(times.back() - times.front());
-        std::vector<double> intervals;
-        for (size_t i = 1; i < times.size(); ++i) {
-          intervals.push_back(double(times[i] - times[i - 1]) / 1e6);
-        }
-        std::sort(intervals.begin(), intervals.end());
-        p50_ = intervals[(intervals.size() - 1) / 2];
-        p95_ = intervals[(intervals.size() * 95 + 99) / 100 - 1];
-      }
-      if (logging && now - logged_ >= std::chrono::seconds(5)) {
-        logged_ = now;
-        REXLOG_INFO("host presentation (recent 2s): {:.2f} FPS, p50 {:.2f} ms, p95 {:.2f} ms; "
-                    "{} samples, not display scanout", fps_, p50_, p95_, times.size());
-      }
-    }
-    if (overlay) {
-      char text[80];
       const auto game = mcla::GetGameUpdateStats();
       if (game.samples) {
-        std::snprintf(text, sizeof(text), "Game updates %.1f FPS  p95 %.0f ms",
+        std::snprintf(text_, sizeof(text_), "Game updates %.1f FPS  p95 %.0f ms",
                       game.fps, game.p95_ms);
       } else {
-        std::snprintf(text, sizeof(text), "Game updates --");
+        std::snprintf(text_, sizeof(text_), "Game updates --");
       }
-      auto* draw = ImGui::GetForegroundDrawList();
-      const ImVec2 size = ImGui::CalcTextSize(text);
-      draw->AddRectFilled(ImVec2(10, 10), ImVec2(22 + size.x, 22 + size.y),
-                          IM_COL32(0, 0, 0, 180), 4);
-      draw->AddText(ImVec2(16, 16), IM_COL32(255, 255, 255, 255), text);
     }
+    auto* draw = ImGui::GetForegroundDrawList();
+    const ImVec2 size = ImGui::CalcTextSize(text_);
+    draw->AddRectFilled(ImVec2(10, 10), ImVec2(22 + size.x, 22 + size.y),
+                        IM_COL32(0, 0, 0, 180), 4);
+    draw->AddText(ImVec2(16, 16), IM_COL32(255, 255, 255, 255), text_);
   }
 
  private:
-  std::chrono::steady_clock::time_point sampled_{}, logged_{};
-  double fps_ = 0, p50_ = 0, p95_ = 0;
+  std::chrono::steady_clock::time_point sampled_{};
+  char text_[80] = "Game updates --";
 };
 #endif
 
@@ -1318,6 +1622,12 @@ void MclaApp::OnCreateDialogs(rex::ui::ImGuiDrawer* drawer) {
 }
 
 void MclaApp::OnShutdown() {
+#if REX_PLATFORM_ANDROID
+  if (diagnostics_thread_.joinable()) {
+    diagnostics_thread_.request_stop();
+    diagnostics_thread_.join();
+  }
+#endif
   fps_counter_.reset();
   video_borders_.reset();
 }

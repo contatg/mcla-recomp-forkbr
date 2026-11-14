@@ -29,6 +29,9 @@ android_patches = [
     "rexglue-android-bionic-link.patch",
     "rexglue-android-driver-selection.patch",
     "rexglue-android-stereo-diagnostic.patch",
+    "rexglue-android-zandatsu-runtime.patch",
+    "rexglue-android-runtime-diagnostics.patch",
+    "rexglue-android-city-trace.patch",
 ]
 
 build_doc = (root / "docs" / "android-build.md").read_text(encoding="utf-8", errors="replace")
@@ -66,11 +69,14 @@ known_hashes = {
     "rexglue-android-present-filters.patch": "a0225b43527a9d8b2208caa70b4921b3e72b191aabadd5f668af85fa8f1dfe70",
     "rexglue-android-sdl-event-pump.patch": "bc697f8d5bf95dfef0d2e62e4e426c727eb9145616ae796fee99e6a20c021912",
     "rexglue-pipeline-storage-layout.patch": "6443791149b1d33979269cf28b27fc76f0df258c06a290b530af94687e317e3a",
-    "rexglue-android-present-stats.patch": "e9457c30aab4b00962f7c47b3e2cafe01de6fd52f8a39a8bcc199d9993cd6ef7",
+    "rexglue-android-present-stats.patch": "3f60fbba95294883aec81298b97b8588b3b96c04c0b269a154513b54da653f05",
     "rexglue-vulkan-frame-start-sync.patch": "7f0622859910bb2bb3a90f5cb93a99fa76f19f7b4ac2503e3a223e5692a89b06",
     "rexglue-android-bionic-link.patch": "e3bf87a2847134ae9b92a0ac2299c6f86359646a234265cbd1e325eadbcb692a",
     "rexglue-android-driver-selection.patch": "d4fec822e4db5a27d0e905e5280c852a0a76002f8f9b8b71894ca166f3159fb5",
     "rexglue-android-stereo-diagnostic.patch": "c624ba301ee3d504a99c04bbd558451c91f79bba303091554c5764dd091096fc",
+    "rexglue-android-zandatsu-runtime.patch": "70048bbe082083dbbb94acaa0dae862633fa1af65f3d57d8c5931825cb4e02ab",
+    "rexglue-android-runtime-diagnostics.patch": "33d5432c432af2fef3ed5c6bf792da842aaee0a7271de8fd51b57f68247045b7",
+    "rexglue-android-city-trace.patch": "6d18f0111fa3ede5e830bd81d80ef892d0a6c7c5f0f65db69efe82ba0f7ed880",
 }
 for name, expected in known_hashes.items():
     path = patch_dir / name

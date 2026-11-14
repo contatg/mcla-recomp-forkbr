@@ -3,12 +3,16 @@ set -eu
 
 ROOT=$(CDPATH= cd -- "$(dirname -- "$0")/.." && pwd)
 OUT="$ROOT/out/android-arm64"
-SDK="$ROOT/out/android-sdk"
+SDK=${MCLA_ANDROID_SDK_ASSETS:-$ROOT/out/android-sdk}
 PLATFORM="$SDK/android-35/android.jar"
 D8="$SDK/build-tools-35.0.1/android-15/lib/d8.jar"
-SDL="$ROOT/third_party/rexglue-sdk/thirdparty/sdl3/android-project/app/src/main/java"
+SDL=${MCLA_SDL_JAVA_DIR:-$ROOT/third_party/rexglue-sdk/thirdparty/sdl3/android-project/app/src/main/java}
 LIBS="$ROOT/out/build/mcla-android-arm64"
-RUNTIME="$ROOT/third_party/rexglue-sdk/out/install/android-arm64/lib"
+RUNTIME=${MCLA_ANDROID_RUNTIME_LIB_DIR:-$ROOT/third_party/rexglue-sdk/out/install/android-arm64/lib}
+LIBCXX=${MCLA_ANDROID_LIBCXX:-${PREFIX:-/data/data/com.termux/files/usr}/lib/libc++_shared.so}
+STRIP=${MCLA_ANDROID_STRIP:-}
+MIN_SDK=${MCLA_ANDROID_MIN_SDK:-23}
+APPLICATION_ID=${MCLA_ANDROID_APPLICATION_ID:-org.mcla.recomp}
 ADRENO="$ROOT/out/build/adrenotools-arm64"
 LOCAL_SHARE_DIR=${MCLA_LOCAL_SHARE_DIR:-${PREFIX:-/data/data/com.termux/files/usr}/share/mcla-recomp}
 DEFAULT_KEYSTORE="$LOCAL_SHARE_DIR/android-debug.keystore"
@@ -89,28 +93,34 @@ printf '%s\n' "$ROOT/android/MclaActivity.java" >> "$OUT/stage/java-sources.txt"
 printf '%s\n' "$ROOT/android/MclaTouchControls.java" >> "$OUT/stage/java-sources.txt"
 printf '%s\n' "$ROOT/android/MclaTouchEditorActivity.java" >> "$OUT/stage/java-sources.txt"
 printf '%s\n' "$ROOT/android/MclaLauncherActivity.java" >> "$OUT/stage/java-sources.txt"
+printf '%s\n' "$ROOT/android/MclaGameImport.java" >> "$OUT/stage/java-sources.txt"
 printf '%s\n' "$ROOT/android/MclaLogExporter.java" >> "$OUT/stage/java-sources.txt"
 printf '%s\n' "$ROOT/android/MclaBuildVariant.java" >> "$OUT/stage/java-sources.txt"
+printf '%s\n' "$ROOT/android/MclaPerformanceProfile.java" >> "$OUT/stage/java-sources.txt"
 javac -encoding UTF-8 --release 8 -classpath "$PLATFORM" \
     -d "$OUT/stage/classes" @"$OUT/stage/java-sources.txt"
-python3 - "$D8" "$PLATFORM" "$OUT/stage/dex" "$OUT/stage/classes" <<'PY'
+python3 - "$D8" "$PLATFORM" "$OUT/stage/dex" "$OUT/stage/classes" "$MIN_SDK" <<'PY'
 import pathlib, subprocess, sys
-d8, platform, output, classes = sys.argv[1:]
+d8, platform, output, classes, min_sdk = sys.argv[1:]
 files = sorted(str(path) for path in pathlib.Path(classes).rglob("*.class"))
 subprocess.run(["java", "-cp", d8, "com.android.tools.r8.D8", "--release",
-                "--min-api", "23", "--lib", platform, "--output", output, *files],
+                "--min-api", min_sdk, "--lib", platform, "--output", output, *files],
                check=True)
 PY
 
 aapt2 link -o "$OUT/stage/apk/base.apk" -I "$PLATFORM" \
-    --manifest "$ROOT/android/AndroidManifest.xml" --min-sdk-version 23 --target-sdk-version 35 \
+    --manifest "$ROOT/android/AndroidManifest.xml" --min-sdk-version "$MIN_SDK" --target-sdk-version 35 \
+    --rename-manifest-package "$APPLICATION_ID" \
     --version-code "$VERSION_CODE" --version-name "$VERSION_NAME"
 
 cp "$LIBS/libmain.so" "$OUT/stage/jni/arm64-v8a/"
 cp "$RUNTIME/librexgpu-xenos.so" "$OUT/stage/jni/arm64-v8a/"
 cp "$RUNTIME/libSDL3.so" "$RUNTIME/librexruntime.so" "$OUT/stage/jni/arm64-v8a/"
-cp "${PREFIX:?Termux PREFIX is required}/lib/libc++_shared.so" "$OUT/stage/jni/arm64-v8a/"
+cp "$LIBCXX" "$OUT/stage/jni/arm64-v8a/libc++_shared.so"
 cp "$ADRENO/libadrenotools.so" "$ADRENO/src/hook/"*.so "$OUT/stage/jni/arm64-v8a/"
+if [ -n "$STRIP" ]; then
+    "$STRIP" --strip-unneeded "$OUT/stage/jni/arm64-v8a/"*.so
+fi
 
 python3 - "$OUT/stage/jni/arm64-v8a" <<'PY'
 import pathlib, subprocess, sys
@@ -136,8 +146,7 @@ apk, dex, jni = map(pathlib.Path, sys.argv[1:])
 with zipfile.ZipFile(apk, "a", compression=zipfile.ZIP_DEFLATED, compresslevel=6) as zf:
     zf.write(dex, "classes.dex")
     for path in sorted(jni.rglob("*.so")):
-        zf.write(path, "lib/arm64-v8a/" + path.name,
-                 compress_type=zipfile.ZIP_STORED)
+        zf.write(path, "lib/arm64-v8a/" + path.name)
 PY
 
 if [ ! -f "$KEYSTORE_PATH" ]; then

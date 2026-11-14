@@ -67,6 +67,9 @@ git -C third_party/rexglue-sdk apply "$PATCHES/rexglue-vulkan-frame-start-sync.p
 git -C third_party/rexglue-sdk apply "$PATCHES/rexglue-android-bionic-link.patch"
 git -C third_party/rexglue-sdk apply "$PATCHES/rexglue-android-driver-selection.patch"
 git -C third_party/rexglue-sdk apply "$PATCHES/rexglue-android-stereo-diagnostic.patch"
+git -C third_party/rexglue-sdk apply "$PATCHES/rexglue-android-zandatsu-runtime.patch"
+git -C third_party/rexglue-sdk apply "$PATCHES/rexglue-android-runtime-diagnostics.patch"
+git -C third_party/rexglue-sdk apply "$PATCHES/rexglue-android-city-trace.patch"
 ```
 
 If the SDK checkout already exists, start with a clean copy at that commit instead of cloning over it. Do not apply a patch twice. The first patch contains the fork's SDK changes as well as Android ARM64 support; the later ones add optional Turnip loading, per-driver Vulkan cache files, lower-priority pipeline compilation and cache writing on Android, the timing and the cvar bounds of the occlusion-query pipeline wait, the presenter's scaling filters, and a reduced initial SDL event pump on Android.
@@ -97,6 +100,10 @@ scripts/build_android_apk.sh
 ```
 
 The first C++ build can take a long time because codegen produces many large translation units. Ninja resumes completed objects after an interruption. Avoid compiling on the same phone during a gameplay performance comparison: it consumes CPU and raises the temperature.
+
+On Linux, run ReXGlue v0.10.0 built for the Linux host to generate the sources before configuring the game. Configure with the Android NDK's toolchain file, `ANDROID_ABI=arm64-v8a`, `ANDROID_STL=c++_shared`, and `REXGLUE_HOST_CODEGEN` pointing to that same host executable. Package with `sh scripts/build_android_apk.sh`. The packager accepts `MCLA_ANDROID_SDK_ASSETS`, `MCLA_ANDROID_RUNTIME_LIB_DIR`, `MCLA_SDL_JAVA_DIR`, `MCLA_ANDROID_LIBCXX` and `MCLA_ANDROID_STRIP` to point to a Linux SDK and NDK build.
+
+Set `MCLA_ANDROID_MIN_SDK` to match the minimum required by the linked native libraries. Set `MCLA_ANDROID_APPLICATION_ID` for a separately signed test package that can be installed next to the existing app.
 
 ## Runtime and known limits
 

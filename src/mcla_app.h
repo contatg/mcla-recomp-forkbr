@@ -5,6 +5,9 @@
 #pragma once
 
 #include <filesystem>
+#ifdef __ANDROID__
+#include <thread>
+#endif
 
 #include <rex/rex_app.h>
 
@@ -52,6 +55,9 @@ class MclaApp : public rex::ReXApp {
   }
 
  private:
+#ifdef __ANDROID__
+  std::jthread diagnostics_thread_;
+#endif
   std::unique_ptr<rex::ui::ImGuiDialog> video_borders_;
   std::unique_ptr<rex::ui::ImGuiDialog> fps_counter_;
   void InstallCrashTrace();

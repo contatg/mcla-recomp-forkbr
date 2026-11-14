@@ -22,13 +22,42 @@ import android.view.WindowManager;
 import org.libsdl.app.SDLActivity;
 import java.io.File;
 import java.io.BufferedReader;
-import java.io.FileInputStream;
-import java.io.FileOutputStream;
 import java.io.FileReader;
 
 public final class MclaActivity extends SDLActivity {
     private static final String TAG = "MCLA";
     private MclaTouchControls touchControls;
+    private android.widget.TextView fpsLabel;
+    private final Runnable updateFps = new Runnable() {
+        @Override public void run() {
+            refreshFpsLabel();
+            logHandler.postDelayed(this, 2000);
+        }
+    };
+
+    private void refreshFpsLabel() {
+        if (fpsLabel == null) return;
+        File log = new File(getFilesDir(), "logs/mcla.log");
+        String label = "FPS: medindo…";
+        try (java.io.RandomAccessFile input = new java.io.RandomAccessFile(log, "r")) {
+            long length = input.length();
+            byte[] tail = new byte[(int) Math.min(length, 64 * 1024)];
+            input.seek(length - tail.length);
+            input.readFully(tail);
+            String report = new String(tail, java.nio.charset.StandardCharsets.UTF_8);
+            String prefix = "host presentation (recent 2s): ";
+            int start = report.lastIndexOf(prefix);
+            if (start >= 0) {
+                int end = report.indexOf(" FPS,", start);
+                if (end >= 0 && end - start < 48) {
+                    label = "FPS: " + report.substring(start + prefix.length(), end);
+                }
+            }
+        } catch (java.io.IOException ignored) {
+            // Native logging starts after the activity is created.
+        }
+        fpsLabel.setText(label);
+    }
     private InputManager inputManager;
     private AudioManager audioManager;
     private AudioFocusRequest audioFocusRequest;
@@ -47,6 +76,7 @@ public final class MclaActivity extends SDLActivity {
         for (int id : InputDevice.getDeviceIds()) {
             InputDevice device = InputDevice.getDevice(id);
             if (device == null || device.isVirtual()) continue;
+            if (Build.VERSION.SDK_INT >= 29 && !device.isExternal()) continue;
             int sources = device.getSources();
             if ((sources & InputDevice.SOURCE_GAMEPAD) == InputDevice.SOURCE_GAMEPAD ||
                     (sources & InputDevice.SOURCE_JOYSTICK) == InputDevice.SOURCE_JOYSTICK) {
@@ -60,7 +90,7 @@ public final class MclaActivity extends SDLActivity {
     private final Runnable exportLogs = new Runnable() {
         @Override public void run() {
             MclaLogExporter.exportAsync(MclaActivity.this);
-            logHandler.postDelayed(this, 60_000);
+            logHandler.postDelayed(this, 15_000);
         }
     };
 
@@ -76,25 +106,44 @@ public final class MclaActivity extends SDLActivity {
         applyAudioEnvironment();
         applyRedMagicShaderEnvironment();
         applyLogEnvironment();
+        applyPerformanceEnvironment();
         applyDriverDebugEnvironment();
-        File source = new File(getApplicationInfo().nativeLibraryDir, "librexgpu-xenos.so");
-        File target = new File(getFilesDir(), "librexgpu-xenos.so");
-        try (FileInputStream input = new FileInputStream(source);
-             FileOutputStream output = new FileOutputStream(target)) {
-            byte[] buffer = new byte[64 * 1024];
-            int count;
-            while ((count = input.read(buffer)) != -1) {
-                output.write(buffer, 0, count);
-            }
+        try {
+            Os.setenv("MCLA_NATIVE_LIBRARY_DIR", getApplicationInfo().nativeLibraryDir, true);
+            Os.setenv("MCLA_DRIVER_TEMP_DIR", getCacheDir().getAbsolutePath(), true);
         } catch (Exception e) {
-            Log.e(TAG, "Could not stage the Xenos Vulkan plugin", e);
+            Log.e(TAG, "Could not configure AdrenoTools library paths", e);
         }
         super.onCreate(state);
+        Log.i(TAG, "SDL activity created, surface=" + (mSurface != null) + ", layout=" + (mLayout != null));
+        if (mSurface != null) {
+            mSurface.getHolder().addCallback(new android.view.SurfaceHolder.Callback() {
+                @Override public void surfaceCreated(android.view.SurfaceHolder holder) {
+                    Log.i(TAG, "SDL surface created");
+                }
+                @Override public void surfaceChanged(android.view.SurfaceHolder holder,
+                        int format, int width, int height) {
+                    Log.i(TAG, "SDL surface changed: " + width + "x" + height + ", format=" + format);
+                }
+                @Override public void surfaceDestroyed(android.view.SurfaceHolder holder) {
+                    Log.i(TAG, "SDL surface destroyed");
+                }
+            });
+        }
         if (mLayout != null) {
             touchControls = new MclaTouchControls(this);
             mLayout.addView(touchControls, new RelativeLayout.LayoutParams(
                     RelativeLayout.LayoutParams.MATCH_PARENT,
                     RelativeLayout.LayoutParams.MATCH_PARENT));
+            touchControls.bringToFront();
+            fpsLabel = new android.widget.TextView(this);
+            fpsLabel.setTextColor(android.graphics.Color.WHITE);
+            fpsLabel.setBackgroundColor(0x99000000);
+            fpsLabel.setPadding(12, 6, 12, 6);
+            RelativeLayout.LayoutParams fpsPosition = new RelativeLayout.LayoutParams(-2, -2);
+            fpsPosition.addRule(RelativeLayout.ALIGN_PARENT_TOP);
+            fpsPosition.addRule(RelativeLayout.CENTER_HORIZONTAL);
+            mLayout.addView(fpsLabel, fpsPosition);
             inputManager = (InputManager) getSystemService(Context.INPUT_SERVICE);
             if (inputManager != null) inputManager.registerInputDeviceListener(gamepadListener, logHandler);
             updateGamepad();
@@ -174,6 +223,18 @@ public final class MclaActivity extends SDLActivity {
         }
     }
 
+    private void applyPerformanceEnvironment() {
+        String profile = MclaPerformanceProfile.resolve(this);
+        try {
+            Os.setenv("REX_MCLA_ANDROID_PERFORMANCE", profile, true);
+            Os.setenv("REX_MCLA_ADRENO_610_COMPATIBILITY",
+                    MclaPerformanceProfile.isSnapdragon680() ? "true" : "false", true);
+            Log.i(TAG, "Graphics performance profile: " + profile);
+        } catch (Exception e) {
+            Log.e(TAG, "Could not apply graphics performance profile", e);
+        }
+    }
+
     private void applyDriverDebugEnvironment() {
         // The Vulkan driver is loaded during SDLActivity.onCreate. Keep this
         // private, opt-in diagnostic setting outside mcla.toml and apply it first.
@@ -220,7 +281,8 @@ public final class MclaActivity extends SDLActivity {
             } else if (debug == null) {
                 // Launcher setting; explicit driver.env takes precedence.
                 debug = getSharedPreferences("driver_debug", MODE_PRIVATE)
-                        .getString("tu_debug", "syncdraw");
+                        .getString("tu_debug", "auto");
+                if ("auto".equals(debug)) debug = MclaPerformanceProfile.defaultTurnipDebug(this);
                 if (!debug.equals("syncdraw") && !debug.equals("noubwc") &&
                         !debug.equals("flushall") && !debug.equals("nolrz") &&
                         !debug.equals("sysmem")) {
@@ -257,15 +319,18 @@ public final class MclaActivity extends SDLActivity {
     @Override
     protected void onResume() {
         super.onResume();
+        logHandler.removeCallbacks(updateFps);
+        logHandler.post(updateFps);
         requestAudioFocus();
         updateGamepad();
         if (touchControls != null) touchControls.resumeControls();
         logHandler.removeCallbacks(exportLogs);
-        logHandler.postDelayed(exportLogs, 30_000);
+        logHandler.postDelayed(exportLogs, 5_000);
     }
 
     @Override
     protected void onPause() {
+        logHandler.removeCallbacks(updateFps);
         logHandler.removeCallbacks(exportLogs);
         if (touchControls != null) touchControls.clearInput();
         abandonAudioFocus();
@@ -275,6 +340,7 @@ public final class MclaActivity extends SDLActivity {
 
     @Override
     protected void onDestroy() {
+        logHandler.removeCallbacks(updateFps);
         logHandler.removeCallbacks(exportLogs);
         if (inputManager != null) inputManager.unregisterInputDeviceListener(gamepadListener);
         if (touchControls != null) touchControls.clearInput();

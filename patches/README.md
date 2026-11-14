@@ -39,6 +39,13 @@ clean checkout:
     requesting separate `pthread` or `rt` libraries: Bionic provides those
     functions in libc, and the NDK does not ship those two libraries. No
     change to the observed gameplay behavior is intended.
+12. `rexglue-android-driver-selection.patch` — select the installed Vulkan driver.
+13. `rexglue-android-stereo-diagnostic.patch` — optional stereo audio diagnostics.
+14. `rexglue-android-zandatsu-runtime.patch` — reduce unnecessary semaphore wakeups,
+    synchronize Vulkan pipeline-cache exports with compilation and use classic
+    render passes on older proprietary Mali drivers. Load the Vulkan plugin
+    from the APK's installed libraries and retry with system Vulkan if the
+    selected driver cannot create a provider.
 
 The first patch is a combined source delta and is intentionally pinned by
 SHA-256 in `scripts/ci/check_pins.py`; it is not described as Android-only.

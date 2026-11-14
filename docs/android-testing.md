@@ -92,33 +92,41 @@ Graphics, Extras and Launch sections. The same import, driver selection,
 shader-pack, touch-editor and Play actions remain available; the appearance
 does not change Vulkan behavior.
 
-## FPS Counter (cleaner overlay)
+## Snapdragon 680 performance
 
-Since v0.1.41, a new FPS counter is integrated into the frame timing system (`mcla_frame_delta` hook). It provides:
+Choose a profile under **Graphics** before pressing **Play**. Automatic selects
+**Performance** when Android 12 or newer reports `SM6225` as its SoC model. The
+profile can also be selected manually.
 
-- **Per-frame timing** with a rolling 240-frame window (~4 seconds at 60 FPS)
-- **Menu vs gameplay separation** (detected via render height < 800px)
-- **Detailed percentiles**: p50, p90, p95, p99, 1% low (p99), 0.1% low (p99.9)
-- **CPU/GPU timing** separation
-- **Separate logging** for menu vs gameplay
+| Profile | Graphics settings |
+| --- | --- |
+| Standard | Uses the regular game and Vulkan settings. |
+| Performance | Disables real-time shadows, MSAA and blur. Uses simpler car shadows, 2× anisotropy, shorter traffic distance and fewer pedestrians and parked cars. |
+| Maximum performance | Reduces city detail further, turns off anisotropy, removes pedestrians and parked cars, and updates reflections every other frame. Uses a 16:9 guest image at 720 lines, so wide displays can have side bars. |
 
-**Important:** The FPS counter only activates during actual gameplay. The app starts in the launcher UI; the frame timing hooks (`mcla_frame_delta`, etc.) are only triggered after pressing "Play" in the launcher and the actual game loop starts.
+Both performance profiles limit Vulkan pipeline creation to two workers, shorten
+waits for queued pipelines during occlusion queries, and spend less CPU time
+waiting for the frame deadline. Maximum performance also compiles eligible
+occlusion-query pipelines in the background. During compilation, the query can
+temporarily treat draws that have no pipeline yet as hidden.
 
-**Configuration (in `files/mcla.toml`):**
-```toml
-mcla_fps_counter_enabled = true
-mcla_fps_counter_window_frames = 120  # 2 seconds at 60 FPS
-mcla_fps_counter_log_interval_ms = 5000
-mcla_fps_counter_separate_menu = true
-```
+When a custom Turnip driver is selected, **Automatic (profile)** disables
+`syncdraw` for both performance profiles. Select `syncdraw` manually if the
+driver shows flickering wheels or rear lights. Settings already saved in
+`mcla.toml` have priority over the profile defaults.
 
-**Log output example:**
-```
-FPS [GAME]: frames=180 avg=22.4 p50=44.6ms p95=67.2ms p99=89.1ms 1%low=89.1ms 0.1%low=112.3ms
-FPS [MENU]: frames=45 avg=58.2 p50=17.2ms p95=18.1ms p99=18.5ms
-```
+## Measuring FPS
 
-**Note:** The FPS counter only activates during actual gameplay. The app starts in the launcher UI; the frame timing hooks are only triggered after pressing "Play" in the launcher.
+Drive the same route for at least two minutes per profile with the same driver.
+Run the route once before measuring to give the shader cache time to warm up.
+The target on Snapdragon 680 is at least 20 new guest frames presented per
+second while driving. This still needs testing on the device.
+
+The Android log reports both new guest frames successfully presented by the
+host and game updates, with a 95th-percentile frame interval for each. Repaints
+of the same guest image do not count as new frames. Both performance profiles
+turn off the on-screen FPS overlay by default and keep the log active.
+The optional `mcla_fps_overlay` and `mcla_fps_log` settings are in `files/mcla.toml`.
 
 ## No game sound until recording starts
 
@@ -307,3 +315,51 @@ No build is performed by this documentation page. The source recipe is in
 [android-build.md](android-build.md), and CI builds the patched SDK and host
 stub without game data. The APK includes AdrenoTools and its hooks, but no
 third-party Turnip driver.
+
+## v0.1.52 — transição para a cidade
+
+A hipótese desta versão é que a espera da thread principal acompanha o
+trabalho de outra thread do guest. A v0.1.51 registrou cerca de uma
+atualização por segundo durante a transição e leituras de 4.112.573 e
+4.562.237 bytes do cache Vulkan em duas sessões Normal. A imagem verde
+ainda precisa de diagnóstico do draw.
+
+- `mcla_city_diagnostics=false` desativa a amostragem de PC e o rastreio
+  detalhado de esperas no `mcla.toml`. Os logs da v0.1.51 continuam ativos.
+- `[hotguest]`: amostra o PC ARM64 da XThread de trabalho com maior
+  consumo de CPU no último segundo parado. O endereço `sub_*` é a
+  função PPC mapeada pela tabela de crash. `outside_guest_code` é uma
+  amostra fora do mapeamento. Não classifique função desconhecida pela
+  porcentagem de amostras.
+- `[guestwait2]`: registra esperas de pelo menos 100 ms. `address_kind`
+  informa se o valor é endereço guest ou handle. O tipo 2 é evento,
+  6 é mutex, 8 é semáforo, 12 é thread e 13 é timer. `signaler=0`
+  indica ausência de um sinal atribuível no intervalo. Um TID registrado
+  é o último sinal instrumentado durante a espera. Em espera múltipla
+  pendente, a linha periódica mostra o primeiro objeto do grupo.
+- `[mem]`: RSS do processo e alocações de render targets a cada 5 s.
+  A contagem cobre o cache residente de alvos.
+- `[pipeline-cache] saved_bytes=`: registra a gravação bem-sucedida
+  do cache. A linha `Loaded ... bytes of VkPipelineCache data` continua
+  indicando o carregamento. Já existe gravação em background após drenar
+  a fila (2 s sem novas criações e intervalo mínimo de 10 s) e no
+  encerramento normal se houver alterações.
+
+| Opção no SD680 | Normal | Performance |
+| --- | --- | --- |
+| TU_DEBUG automático para Turnip | `syncdraw` | Sem override |
+| Anti-alias, blur e sombras | Configuração padrão do jogo/preset | Desligados, com caminho rápido de sombra de carro |
+| LOD cidade / tráfego | Configuração padrão do jogo/preset | 0,75 / 0,5 |
+| Distância de tráfego / pedestres / carros estacionados | Configuração padrão do jogo/preset | 250 / 0,5 / 0,5 |
+| Anisotropia | Configuração padrão do jogo/preset | 2 |
+| Espera de pipeline em occlusion query | 500 ms por padrão | 8 ms por padrão |
+| Janela de espera ativa por quadro | 1.500 µs por padrão | 300 µs por padrão |
+| Compiladores Vulkan | 2 | 2 |
+| Dynamic rendering / upload direto / pausa em frames incompletos | Desligados na compatibilidade Adreno 610 | Desligados na compatibilidade Adreno 610 |
+| Hook de fence em `render_perf.cpp` | Mesma configuração | Mesma configuração |
+
+Teste cada perfil por até 90 s na cidade ou até entrar em uma corrida.
+Exporte em **Extras → Exportar diagnóstico** logo depois de cada teste,
+salve as duas cópias com nomes diferentes e informe se houve imagem verde,
+áudio e corrida. Inclua as linhas `[stage]`, `[hotguest]` e
+`[guestwait2]` desde a transição.
