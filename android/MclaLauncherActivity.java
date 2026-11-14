@@ -44,6 +44,7 @@ public final class MclaLauncherActivity extends Activity {
     private static final int PICK_GAME_FOLDER = 1;
     private static final int PICK_DRIVER_ZIP = 2;
     private static final int PICK_SHADER_PACK = 3;
+    private static final int SAVE_DIAGNOSTIC = 4;
     private static final long MAX_DRIVER_BYTES = 128L * 1024 * 1024;
     private static final long MAX_DRIVER_ZIP_BYTES = MAX_DRIVER_BYTES + 8L * 1024 * 1024;
     private static final int MAX_DRIVER_METADATA_BYTES = 64 * 1024;
@@ -284,6 +285,17 @@ public final class MclaLauncherActivity extends Activity {
                 startActivity(new Intent(this, MclaTouchEditorActivity.class)));
         addAction(extrasCard, touchEditor, false);
 
+        Button diagnostic = new Button(this);
+        diagnostic.setText("Exportar diagnóstico");
+        diagnostic.setOnClickListener(view -> {
+            Intent intent = new Intent(Intent.ACTION_CREATE_DOCUMENT);
+            intent.addCategory(Intent.CATEGORY_OPENABLE);
+            intent.setType("text/plain");
+            intent.putExtra(Intent.EXTRA_TITLE, "mcla-diagnostico.txt");
+            startActivityForResult(intent, SAVE_DIAGNOSTIC);
+        });
+        addAction(extrasCard, diagnostic, false);
+
         audioButton = new Button(this);
         audioButton.setOnClickListener(view -> {
             if (MclaBuildVariant.isRedMagicAudioTest(this)) return;
@@ -439,6 +451,17 @@ public final class MclaLauncherActivity extends Activity {
     @Override
     protected void onActivityResult(int requestCode, int resultCode, Intent data) {
         super.onActivityResult(requestCode, resultCode, data);
+        if (requestCode == SAVE_DIAGNOSTIC) {
+            if (resultCode == RESULT_OK && data != null && data.getData() != null) {
+                MclaLogExporter.saveDiagnostic(this, data.getData(),
+                        () -> runOnUiThread(() -> android.widget.Toast.makeText(this,
+                                "Diagnóstico salvo", android.widget.Toast.LENGTH_LONG).show()),
+                        error -> runOnUiThread(() -> android.widget.Toast.makeText(this,
+                                "Falha ao salvar: " + error.getMessage(),
+                                android.widget.Toast.LENGTH_LONG).show()));
+            }
+            return;
+        }
         if (resultCode != RESULT_OK || data == null) return;
         if (requestCode == PICK_DRIVER_ZIP) {
             Uri uri = data.getData();

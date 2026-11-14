@@ -25,6 +25,90 @@ final class MclaLogExporter {
 
     private MclaLogExporter() {}
 
+    static void saveDiagnostic(Context context, Uri target, Runnable done,
+            java.util.function.Consumer<Exception> failed) {
+        Context app = context.getApplicationContext();
+        new Thread(() -> {
+            try {
+                try (OutputStream output = app.getContentResolver().openOutputStream(target, "wt")) {
+                    if (output == null) throw new java.io.IOException("Cannot open diagnostic file");
+                    writeDiagnostic(app, output);
+                }
+                done.run();
+            } catch (Exception error) {
+                failed.accept(error);
+            }
+        }, "MCLA diagnostic").start();
+    }
+
+    private static void writeDiagnostic(Context app, OutputStream output) throws Exception {
+        String version = app.getPackageManager().getPackageInfo(app.getPackageName(), 0).versionName;
+        writeText(output, "MCLA " + version + " | Android " + Build.VERSION.RELEASE
+                + " | " + Build.MANUFACTURER + " " + Build.MODEL + "\nCollected "
+                + new java.util.Date() + "\nGraphics profile: " + MclaPerformanceProfile.resolve(app)
+                + "\n");
+        File files = app.getFilesDir();
+        for (String path : new String[]{"gpu-drivers/selected.txt", "logs/mcla.1.log", "logs/mcla.log"}) {
+            File file = new File(files, path);
+            writeText(output, "\n=== " + path + " ===\n");
+            if (!file.isFile()) {
+                writeText(output, "Unavailable\n");
+                continue;
+            }
+            try (java.io.RandomAccessFile input = new java.io.RandomAccessFile(file, "r")) {
+                long length = input.length();
+                long remaining = Math.min(length, 2L * 1024 * 1024);
+                input.seek(length - remaining);
+                byte[] buffer = new byte[8192];
+                while (remaining > 0) {
+                    int count = input.read(buffer, 0, (int) Math.min(buffer.length, remaining));
+                    if (count < 0) break;
+                    output.write(buffer, 0, count);
+                    remaining -= count;
+                }
+            } catch (java.io.IOException error) {
+                writeText(output, "\nFile changed or could not be read: " + error + "\n");
+            }
+        }
+        if (Build.VERSION.SDK_INT >= 30) {
+            writeText(output, "\n=== Android process exits (historical) ===\n");
+            ActivityManager manager = app.getSystemService(ActivityManager.class);
+            if (manager != null) {
+                for (ApplicationExitInfo exit : manager.getHistoricalProcessExitReasons(null, 0, 5)) {
+                    writeText(output, new java.util.Date(exit.getTimestamp()) + " pid=" + exit.getPid()
+                            + " reason=" + exit.getReason() + " status=" + exit.getStatus()
+                            + " " + exit.getDescription() + "\n");
+                }
+            }
+        }
+        writeText(output, "\n=== App-visible Android logcat ===\n");
+        Process process = null;
+        try {
+            process = new ProcessBuilder("/system/bin/logcat", "-d", "-t", "400",
+                    "-b", "main", "-b", "system", "-b", "crash", "-v", "threadtime",
+                    "--uid=" + android.os.Process.myUid())
+                    .redirectErrorStream(true).start();
+            try (InputStream input = process.getInputStream()) {
+                byte[] buffer = new byte[8192];
+                int remaining = 512 * 1024;
+                while (remaining > 0) {
+                    int count = input.read(buffer, 0, Math.min(buffer.length, remaining));
+                    if (count < 0) break;
+                    output.write(buffer, 0, count);
+                    remaining -= count;
+                }
+            }
+        } catch (java.io.IOException error) {
+            writeText(output, "Android logcat unavailable: " + error + "\n");
+        } finally {
+            if (process != null) process.destroy();
+        }
+    }
+
+    private static void writeText(OutputStream output, String text) throws java.io.IOException {
+        output.write(text.getBytes(java.nio.charset.StandardCharsets.UTF_8));
+    }
+
     static void exportAsync(Context context) {
         Context app = context.getApplicationContext();
         new Thread(() -> export(app), "MCLA log export").start();

@@ -59,7 +59,7 @@ public final class MclaActivity extends SDLActivity {
     private final Runnable exportLogs = new Runnable() {
         @Override public void run() {
             MclaLogExporter.exportAsync(MclaActivity.this);
-            logHandler.postDelayed(this, 60_000);
+            logHandler.postDelayed(this, 15_000);
         }
     };
 
@@ -84,6 +84,21 @@ public final class MclaActivity extends SDLActivity {
             Log.e(TAG, "Could not configure AdrenoTools library paths", e);
         }
         super.onCreate(state);
+        Log.i(TAG, "SDL activity created, surface=" + (mSurface != null) + ", layout=" + (mLayout != null));
+        if (mSurface != null) {
+            mSurface.getHolder().addCallback(new android.view.SurfaceHolder.Callback() {
+                @Override public void surfaceCreated(android.view.SurfaceHolder holder) {
+                    Log.i(TAG, "SDL surface created");
+                }
+                @Override public void surfaceChanged(android.view.SurfaceHolder holder,
+                        int format, int width, int height) {
+                    Log.i(TAG, "SDL surface changed: " + width + "x" + height + ", format=" + format);
+                }
+                @Override public void surfaceDestroyed(android.view.SurfaceHolder holder) {
+                    Log.i(TAG, "SDL surface destroyed");
+                }
+            });
+        }
         if (mLayout != null) {
             touchControls = new MclaTouchControls(this);
             mLayout.addView(touchControls, new RelativeLayout.LayoutParams(
@@ -269,7 +284,7 @@ public final class MclaActivity extends SDLActivity {
         updateGamepad();
         if (touchControls != null) touchControls.resumeControls();
         logHandler.removeCallbacks(exportLogs);
-        logHandler.postDelayed(exportLogs, 30_000);
+        logHandler.postDelayed(exportLogs, 5_000);
     }
 
     @Override
