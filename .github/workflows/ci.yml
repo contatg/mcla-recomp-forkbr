@@ -106,7 +106,8 @@ jobs:
             rexglue-android-bionic-link.patch \
             rexglue-android-driver-selection.patch \
             rexglue-android-stereo-diagnostic.patch \
-            rexglue-android-zandatsu-runtime.patch; do
+            rexglue-android-zandatsu-runtime.patch \
+            rexglue-android-runtime-diagnostics.patch; do
             git -C "$sdk" apply "$GITHUB_WORKSPACE/patches/$patch"
           done
 

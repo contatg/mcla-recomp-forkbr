@@ -9,6 +9,7 @@
 #include <string>
 #include <thread>
 
+#include <rex/android_diagnostics.h>
 #include <rex/cvar.h>
 #include <rex/logging.h>
 #include <rex/runtime.h>
@@ -302,6 +303,9 @@ bool mcla_fence_spin() {
   // wake-up latency low; every so often give the core away entirely.
   static thread_local uint32_t spins = 0;
   if ((++spins & 0x3F) == 0) {
+#if REX_PLATFORM_ANDROID
+    rex::AndroidWaitScope wait(rex::AndroidWait::kGpu);
+#endif
     const int sleep_us = REXCVAR_GET(mcla_fence_sleep_us);
     if (sleep_us > 0) {
       std::this_thread::sleep_for(std::chrono::microseconds(sleep_us));

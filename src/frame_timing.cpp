@@ -31,6 +31,7 @@
 #include <thread>
 #include <unordered_map>
 
+#include <rex/android_diagnostics.h>
 #include <rex/chrono/clock.h>
 #include <rex/cvar.h>
 #include <rex/logging.h>
@@ -789,6 +790,9 @@ void mcla_frame_start(PPCRegister& r3) {
 }
 
 void mcla_frame_delta(PPCRegister& r8) {
+#if REX_PLATFORM_ANDROID
+  rex::GetAndroidDiagnostics().guest_updates.fetch_add(1, std::memory_order_relaxed);
+#endif
   mcla::RecordGameUpdate();
 #ifdef __ANDROID__
   MclaLogAndroidFps();

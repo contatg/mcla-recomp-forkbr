@@ -48,6 +48,12 @@
 
 #if defined(__ANDROID__)
 #include <android/log.h>
+#include <condition_variable>
+#include <mutex>
+#include <sstream>
+#include <unordered_map>
+#include <unistd.h>
+#include <rex/android_diagnostics.h>
 #endif
 
 #include <rex/platform.h>
@@ -873,6 +879,7 @@ void MclaApp::OnPreSetup(rex::RuntimeConfig& config) {
   MclaApplyAndroidPerformanceProfile();
   if (REXCVAR_GET(mcla_adreno_610_compatibility)) {
     rex::cvar::SetDefaultValue("texture_load_direct_unscaled", "false");
+    rex::cvar::SetFlagFromCommandLine("vulkan_pipeline_creation_threads", "2");
     rex::cvar::SetDefaultValue("vulkan_dynamic_rendering", "false");
     rex::cvar::SetDefaultValue("mcla_aspect_ratio", "16:9");
     rex::cvar::SetDefaultValue("present_ui_overlay", "false");
@@ -1217,7 +1224,126 @@ void MclaApp::OnGuestThreadExit(rex::system::XThread* thread) {
   MclaPumpWakeShutdownBegins();
 }
 
+#if REX_PLATFORM_ANDROID
+namespace {
+struct AndroidThreadCpu {
+  int tid;
+  uint64_t ticks;
+  std::string name;
+};
+
+std::vector<AndroidThreadCpu> ReadAndroidThreadCpu() {
+  std::vector<AndroidThreadCpu> threads;
+  std::error_code error;
+  for (std::filesystem::directory_iterator it("/proc/self/task", error), end;
+       !error && it != end; it.increment(error)) {
+    std::ifstream stat(it->path() / "stat");
+    std::string line;
+    if (!std::getline(stat, line)) continue;
+    const auto first = line.find('(');
+    const auto last = line.rfind(')');
+    if (first == std::string::npos || last <= first || last + 2 >= line.size()) continue;
+    std::istringstream fields(line.substr(last + 2));
+    std::string field;
+    for (int number = 3; number < 14; ++number) fields >> field;
+    int tid = 0;
+    uint64_t user = 0, system = 0;
+    if (std::sscanf(line.c_str(), "%d", &tid) == 1 && fields >> user >> system) {
+      threads.push_back({tid, user + system, line.substr(first + 1, last - first - 1)});
+    }
+  }
+  return threads;
+}
+
+void SampleAndroidRuntime(std::stop_token stop) {
+  using namespace std::chrono;
+  auto& data = rex::GetAndroidDiagnostics();
+  const auto start = steady_clock::now();
+  auto last = start;
+  auto prev_threads = ReadAndroidThreadCpu();
+  const long ticks_per_sec = sysconf(_SC_CLK_TCK);
+  uint64_t previous_bytes = 0, previous_reads = 0, previous_read_ns = 0;
+  constexpr auto wait_count = unsigned(rex::AndroidWait::kCount);
+  uint64_t previous_wait[wait_count]{};
+  const char* wait_names[wait_count] = {"event", "io", "gpu", "write_watch"};
+  std::mutex mutex;
+  std::condition_variable_any timer;
+  std::unique_lock lock(mutex);
+  while (!stop.stop_requested()) {
+    timer.wait_until(lock, stop, last + seconds(1), [] { return false; });
+    if (stop.stop_requested()) break;
+    const auto now = steady_clock::now();
+    const double seconds_elapsed = duration<double>(now - last).count();
+    last = now;
+
+    REXLOG_INFO("[stage] t={}s guest_frames={} presented={} pipelines_pending={} "
+                "pipelines_created={} last_vk_wait={} guest_updates={}",
+                duration_cast<seconds>(now - start).count(), data.frames.load(),
+                data.presented.load(),
+                data.pipelines_pending.load() + data.pipelines_preloading.load(),
+                data.pipelines_created.load(), data.last_vk_wait.load(), data.guest_updates.load());
+
+    auto threads = ReadAndroidThreadCpu();
+    std::unordered_map<int, uint64_t> previous_ticks;
+    for (const auto& entry : prev_threads) previous_ticks.emplace(entry.tid, entry.ticks);
+    std::vector<std::pair<uint64_t, const AndroidThreadCpu*>> top;
+    for (const auto& entry : threads) {
+      auto old = previous_ticks.find(entry.tid);
+      if (old != previous_ticks.end() && entry.ticks >= old->second) {
+        top.emplace_back(entry.ticks - old->second, &entry);
+      }
+    }
+    const auto count = std::min<size_t>(5, top.size());
+    std::partial_sort(top.begin(), top.begin() + count, top.end(),
+                      [](const auto& a, const auto& b) { return a.first > b.first; });
+    std::string cpu;
+    if (ticks_per_sec > 0) {
+      for (size_t i = 0; i < count; ++i) {
+        const auto& [ticks, entry] = top[i];
+        cpu += fmt::format(" {}={} cpu%={:.1f}", entry->name, entry->tid,
+                           100.0 * ticks / (ticks_per_sec * seconds_elapsed));
+      }
+    }
+    REXLOG_INFO("[threads]{}", cpu.empty() ? " unavailable" : cpu);
+    prev_threads = std::move(threads);
+
+    const auto bytes = data.read_bytes.load();
+    const auto reads = data.read_count.load();
+    const auto read_ns = data.read_ns.load();
+    const auto read_delta = reads - previous_reads;
+    REXLOG_INFO("[io] bytes={} reads={} avg_read_ms={:.3f}",
+                bytes - previous_bytes, read_delta,
+                read_delta ? double(read_ns - previous_read_ns) / read_delta / 1e6 : 0.0);
+    previous_bytes = bytes;
+    previous_reads = reads;
+    previous_read_ns = read_ns;
+
+    std::string waits;
+    for (unsigned i = 0; i < wait_count; ++i) {
+      const auto sequence = data.wait_sequence[i].load();
+      const auto active = data.active_since[i].load();
+      auto total = data.wait_ns[i].load();
+      const auto current = rex::AndroidDiagnosticNow();
+      if ((sequence & 1) || sequence != data.wait_sequence[i].load()) {
+        total = previous_wait[i];
+      } else if (active && current >= active) {
+        total += current - active;
+      }
+      const auto delta = total >= previous_wait[i] ? total - previous_wait[i] : 0;
+      previous_wait[i] = total;
+      waits += fmt::format(" {}_ms={:.3f}", wait_names[i], double(delta) / 1e6);
+    }
+    REXLOG_INFO("[guestwait] tid={}{}", data.guest_tid.load(), waits);
+    rex::FlushLogging();
+  }
+}
+}  // namespace
+#endif
+
 void MclaApp::OnPostSetup() {
+#if REX_PLATFORM_ANDROID
+  diagnostics_thread_ = std::jthread(SampleAndroidRuntime);
+#endif
   ConfigureFrameTiming();
   FollowCursorSetting();
 
@@ -1347,6 +1473,12 @@ void MclaApp::OnCreateDialogs(rex::ui::ImGuiDrawer* drawer) {
 }
 
 void MclaApp::OnShutdown() {
+#if REX_PLATFORM_ANDROID
+  if (diagnostics_thread_.joinable()) {
+    diagnostics_thread_.request_stop();
+    diagnostics_thread_.join();
+  }
+#endif
   fps_counter_.reset();
   video_borders_.reset();
 }

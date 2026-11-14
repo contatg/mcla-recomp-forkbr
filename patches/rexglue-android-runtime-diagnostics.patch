@@ -1,0 +1,716 @@
+diff --git a/include/rex/android_diagnostics.h b/include/rex/android_diagnostics.h
+new file mode 100644
+index 0000000..4f02d29
+--- /dev/null
++++ b/include/rex/android_diagnostics.h
+@@ -0,0 +1,56 @@
++#pragma once
++
++#include <rex/platform.h>
++
++#if REX_PLATFORM_ANDROID
++#include <atomic>
++#include <chrono>
++#include <cstdint>
++
++namespace rex {
++enum class AndroidWait : unsigned { kEvent, kIo, kGpu, kWriteWatch, kCount };
++struct AndroidDiagnostics {
++  std::atomic<int> guest_tid{0};
++  std::atomic<int> pipelines_pending{0}, pipelines_preloading{0};
++  std::atomic<uint64_t> guest_updates{0};
++  std::atomic<const char*> swapchain_reason{"surface_outdated"};
++  std::atomic<uint64_t> frames{0}, presented{0}, pipelines_created{0};
++  std::atomic<uint64_t> read_bytes{0}, read_count{0}, read_ns{0};
++  std::atomic<const char*> last_vk_wait{"none"};
++  std::atomic<uint64_t> wait_ns[unsigned(AndroidWait::kCount)]{};
++  std::atomic<uint64_t> wait_sequence[unsigned(AndroidWait::kCount)]{};
++  std::atomic<uint64_t> active_since[unsigned(AndroidWait::kCount)]{};
++};
++
++AndroidDiagnostics& GetAndroidDiagnostics();
++int AndroidDiagnosticTid();
++
++inline uint64_t AndroidDiagnosticNow() {
++  return std::chrono::duration_cast<std::chrono::nanoseconds>(
++      std::chrono::steady_clock::now().time_since_epoch()).count();
++}
++
++class AndroidWaitScope {
++ public:
++  explicit AndroidWaitScope(AndroidWait kind) : index_(unsigned(kind)) {
++    auto& data = GetAndroidDiagnostics();
++    if (data.guest_tid.load(std::memory_order_relaxed) != AndroidDiagnosticTid()) return;
++    start_ = AndroidDiagnosticNow();
++    uint64_t empty = 0;
++    if (!data.active_since[index_].compare_exchange_strong(empty, start_)) start_ = 0;
++  }
++  ~AndroidWaitScope() {
++    if (!start_) return;
++    auto& data = GetAndroidDiagnostics();
++    data.wait_sequence[index_].fetch_add(1);
++    data.wait_ns[index_].fetch_add(AndroidDiagnosticNow() - start_);
++    data.active_since[index_].store(0);
++    data.wait_sequence[index_].fetch_add(1);
++  }
++
++ private:
++  unsigned index_;
++  uint64_t start_ = 0;
++};
++}  // namespace rex
++#endif
+diff --git a/include/rex/ui/windowed_app_context_sdl.h b/include/rex/ui/windowed_app_context_sdl.h
+index 23737b3..406ac7e 100644
+--- a/include/rex/ui/windowed_app_context_sdl.h
++++ b/include/rex/ui/windowed_app_context_sdl.h
+@@ -45,6 +45,7 @@ class SDLWindowedAppContext final : public WindowedAppContext {
+   void UnregisterWindow(SDL_WindowID id) { windows_.erase(id); }
+ 
+  private:
++  friend class WindowSDL;
+   WindowSDL* GetWindow(SDL_WindowID id) const {
+     auto it = windows_.find(id);
+     return it != windows_.end() ? it->second : nullptr;
+diff --git a/src/core/logging.cpp b/src/core/logging.cpp
+index 1645848..afc39c4 100644
+--- a/src/core/logging.cpp
++++ b/src/core/logging.cpp
+@@ -9,6 +9,7 @@
+  *              See LICENSE file in the project root for full license text.
+  */
+ 
++#include <rex/android_diagnostics.h>
+ #include <algorithm>
+ #include <cctype>
+ #include <charconv>
+@@ -56,7 +57,21 @@ REXCVAR_DEFINE_INT32(log_max_files, 20, "Log", "Max number of rotated log files
+     .range(1, 100)
+     .lifecycle(rex::cvar::Lifecycle::kInitOnly);
+ 
++#if REX_PLATFORM_ANDROID
++#include <unistd.h>
++#endif
++
+ namespace rex {
++#if REX_PLATFORM_ANDROID
++AndroidDiagnostics& GetAndroidDiagnostics() {
++  static AndroidDiagnostics data;
++  return data;
++}
++int AndroidDiagnosticTid() {
++  thread_local const int tid = gettid();
++  return tid;
++}
++#endif
+ 
+ namespace {
+ 
+diff --git a/src/graphics/vulkan/command_processor.cpp b/src/graphics/vulkan/command_processor.cpp
+index 9e7d143..3527b2d 100644
+--- a/src/graphics/vulkan/command_processor.cpp
++++ b/src/graphics/vulkan/command_processor.cpp
+@@ -9,6 +9,7 @@
+  * @modified    Tom Clay, 2026 - Adapted for ReXGlue runtime
+  */
+ 
++#include <rex/android_diagnostics.h>
+ #include <atomic>
+ #include <chrono>
+ #include <algorithm>
+@@ -6385,6 +6386,9 @@ void VulkanCommandProcessor::CheckSubmissionFenceAndDeviceLoss(uint64_t await_su
+     // order."
+     const uint64_t wait_start_us = CounterNowMicros();
+     PERF_counter_add_batched(REXCVAR_GET(gpu_batch_perf_counters), kCommandBufferStalls, 1);
++#if REX_PLATFORM_ANDROID
++    rex::GetAndroidDiagnostics().last_vk_wait.store("vkWaitForFences", std::memory_order_relaxed);
++#endif
+     VkResult wait_result =
+         dfn.vkWaitForFences(device, uint32_t(await_submission - submission_completed_),
+                             submissions_in_flight_fences_.data(), VK_TRUE, UINT64_MAX);
+diff --git a/src/graphics/vulkan/pipeline_cache.cpp b/src/graphics/vulkan/pipeline_cache.cpp
+index 86b7204..d5f10ed 100644
+--- a/src/graphics/vulkan/pipeline_cache.cpp
++++ b/src/graphics/vulkan/pipeline_cache.cpp
+@@ -9,6 +9,7 @@
+  * @modified    Tom Clay, 2026 - Adapted for ReXGlue runtime
+  */
+ 
++#include <rex/android_diagnostics.h>
+ #include <algorithm>
+ #include <array>
+ #include <atomic>
+@@ -898,6 +899,9 @@ void VulkanPipelineCache::InitializeShaderStorage(const std::filesystem::path& c
+     }
+     creation_thread_count = std::min(creation_thread_count, pipeline_creations.size());
+ 
++#if REX_PLATFORM_ANDROID
++    rex::GetAndroidDiagnostics().pipelines_preloading.store(int(pipeline_creations.size()));
++#endif
+     std::atomic<size_t> next_creation_index(0);
+     std::atomic<size_t> created_pipeline_count(0);
+     // Progress lines for a front end (shader_storage_progress).
+@@ -913,6 +917,9 @@ void VulkanPipelineCache::InitializeShaderStorage(const std::filesystem::path& c
+         if (created) {
+           created_pipeline_count.fetch_add(1);
+         }
++#if REX_PLATFORM_ANDROID
++        rex::GetAndroidDiagnostics().pipelines_preloading.fetch_sub(1, std::memory_order_relaxed);
++#endif
+         progress.Done(created);
+       }
+     };
+@@ -1141,6 +1148,9 @@ void VulkanPipelineCache::Shutdown() {
+       creation_queue_.pop();
+     }
+     creation_threads_busy_ = 0;
++#if REX_PLATFORM_ANDROID
++    rex::GetAndroidDiagnostics().pipelines_pending.store(0, std::memory_order_relaxed);
++#endif
+     startup_loading_ = false;
+     creation_completion_set_event_ = false;
+     creation_threads_shutdown_from_ = SIZE_MAX;
+@@ -1532,6 +1542,10 @@ bool VulkanPipelineCache::ConfigurePipeline(
+     {
+       std::lock_guard<std::mutex> lock(creation_request_lock_);
+       creation_queue_.push(creation_arguments_real);
++#if REX_PLATFORM_ANDROID
++      rex::GetAndroidDiagnostics().pipelines_pending.store(
++          int(creation_queue_.size() + creation_threads_busy_), std::memory_order_relaxed);
++#endif
+     }
+     creation_request_cond_.notify_one();
+     queued_async_creation = true;
+@@ -1545,6 +1559,10 @@ bool VulkanPipelineCache::ConfigurePipeline(
+         {
+           std::lock_guard<std::mutex> lock(creation_request_lock_);
+           creation_queue_.push(creation_arguments_real);
++#if REX_PLATFORM_ANDROID
++      rex::GetAndroidDiagnostics().pipelines_pending.store(
++          int(creation_queue_.size() + creation_threads_busy_), std::memory_order_relaxed);
++#endif
+         }
+         creation_request_cond_.notify_one();
+         queued_async_creation = true;
+@@ -3909,6 +3927,9 @@ bool VulkanPipelineCache::EnsurePipelineCreated(const PipelineCreationArguments&
+         uint32_t(use_dynamic_rendering));
+     return false;
+   }
++#if REX_PLATFORM_ANDROID
++  rex::GetAndroidDiagnostics().pipelines_created.fetch_add(1, std::memory_order_relaxed);
++#endif
+   if (vk_pipeline_cache_ != VK_NULL_HANDLE) {
+     vk_pipeline_cache_dirty_.store(true, std::memory_order_relaxed);
+     vk_pipeline_cache_last_creation_us_.store(
+@@ -3987,6 +4008,10 @@ void VulkanPipelineCache::CreationThread(size_t thread_index) {
+     {
+       std::lock_guard<std::mutex> lock(creation_request_lock_);
+       --creation_threads_busy_;
++#if REX_PLATFORM_ANDROID
++      rex::GetAndroidDiagnostics().pipelines_pending.store(
++          int(creation_queue_.size() + creation_threads_busy_), std::memory_order_relaxed);
++#endif
+     }
+     async_creation_done_cond_.notify_all();
+   }
+@@ -4017,6 +4042,10 @@ void VulkanPipelineCache::CreateQueuedPipelinesOnProcessorThread() {
+       }
+       creation_arguments = creation_queue_.top();
+       creation_queue_.pop();
++#if REX_PLATFORM_ANDROID
++      rex::GetAndroidDiagnostics().pipelines_pending.store(
++          int(creation_queue_.size() + creation_threads_busy_), std::memory_order_relaxed);
++#endif
+     }
+     bool created = EnsurePipelineCreated(creation_arguments);
+     if (!created) {
+diff --git a/src/system/mmio_handler.cpp b/src/system/mmio_handler.cpp
+index 2b93005..7cbd285 100644
+--- a/src/system/mmio_handler.cpp
++++ b/src/system/mmio_handler.cpp
+@@ -9,6 +9,7 @@
+  * @modified    Tom Clay, 2026 - Adapted for ReXGlue runtime
+  */
+ 
++#include <rex/android_diagnostics.h>
+ #include <algorithm>
+ #include <cstring>
+ #include <utility>
+@@ -402,6 +403,9 @@ bool MMIOHandler::ExceptionCallback(arch::Exception* ex) {
+     }
+   }
+   if (!range) {
++#if REX_PLATFORM_ANDROID
++    rex::AndroidWaitScope wait(rex::AndroidWait::kWriteWatch);
++#endif
+     // Recheck if the pages are still protected (race condition - another thread
+     // clears the watch we just hit).
+     // Do this under the lock so we don't introduce another race condition.
+diff --git a/src/system/xfile.cpp b/src/system/xfile.cpp
+index 4179e8b..f692fd5 100644
+--- a/src/system/xfile.cpp
++++ b/src/system/xfile.cpp
+@@ -9,6 +9,7 @@
+  * @modified    Tom Clay, 2026 - Adapted for ReXGlue runtime
+  */
+ 
++#include <rex/android_diagnostics.h>
+ #include <rex/filesystem/vfs.h>
+ #include <rex/logging.h>
+ #include <rex/math.h>
+@@ -155,6 +156,11 @@ X_STATUS XFile::ReadInternal(uint32_t buffer_guest_address, uint32_t buffer_leng
+                                         memory::PageAccess::kReadWrite) {
+           result = X_STATUS_ACCESS_VIOLATION;
+         } else {
++#if REX_PLATFORM_ANDROID
++          uint64_t started = rex::AndroidDiagnosticNow();
++          {
++          rex::AndroidWaitScope wait(rex::AndroidWait::kIo);
++#endif
+           result = file_->ReadSync(
+               std::span<uint8_t>(
+                   buffer_physical_heap
+@@ -163,6 +169,13 @@ X_STATUS XFile::ReadInternal(uint32_t buffer_guest_address, uint32_t buffer_leng
+                       : memory()->TranslateVirtual(buffer_guest_address),
+                   buffer_length),
+               size_t(byte_offset), &bytes_read);
++#if REX_PLATFORM_ANDROID
++          }
++          auto& diag = rex::GetAndroidDiagnostics();
++          diag.read_ns.fetch_add(rex::AndroidDiagnosticNow() - started, std::memory_order_relaxed);
++          diag.read_bytes.fetch_add(bytes_read, std::memory_order_relaxed);
++          diag.read_count.fetch_add(1, std::memory_order_relaxed);
++#endif
+           if (XSUCCEEDED(result)) {
+             if (buffer_physical_heap) {
+               buffer_physical_heap->TriggerCallbacks(
+diff --git a/src/system/xobject.cpp b/src/system/xobject.cpp
+index d358f39..facdc82 100644
+--- a/src/system/xobject.cpp
++++ b/src/system/xobject.cpp
+@@ -9,6 +9,7 @@
+  * @modified    Tom Clay, 2026 - Adapted for ReXGlue runtime
+  */
+ 
++#include <rex/android_diagnostics.h>
+ #include <vector>
+ 
+ #include <rex/chrono/clock.h>
+@@ -213,7 +214,12 @@ X_STATUS XObject::Wait(uint32_t wait_reason, uint32_t processor_mode, uint32_t a
+                                 : std::chrono::milliseconds::max();
+ 
+   XThread::CheckTitleTermination();
+-  auto result = rex::thread::Wait(wait_handle, alertable ? true : false, timeout_ms);
++  auto result = [&] {
++#if REX_PLATFORM_ANDROID
++    rex::AndroidWaitScope wait(rex::AndroidWait::kEvent);
++#endif
++    return rex::thread::Wait(wait_handle, alertable ? true : false, timeout_ms);
++  }();
+   XThread::CheckTitleTermination();
+   switch (result) {
+     case rex::thread::WaitResult::kSuccess:
+@@ -274,8 +280,12 @@ X_STATUS XObject::WaitMultiple(uint32_t count, XObject** objects, uint32_t wait_
+ 
+   XThread::CheckTitleTermination();
+   if (wait_type) {
+-    auto result =
+-        rex::thread::WaitAny(std::move(wait_handles), alertable ? true : false, timeout_ms);
++    auto result = [&] {
++#if REX_PLATFORM_ANDROID
++    rex::AndroidWaitScope wait(rex::AndroidWait::kEvent);
++#endif
++    return rex::thread::WaitAny(std::move(wait_handles), alertable ? true : false, timeout_ms);
++  }();
+     XThread::CheckTitleTermination();
+     switch (result.first) {
+       case rex::thread::WaitResult::kSuccess:
+@@ -295,8 +305,12 @@ X_STATUS XObject::WaitMultiple(uint32_t count, XObject** objects, uint32_t wait_
+         return X_STATUS_UNSUCCESSFUL;
+     }
+   } else {
+-    auto result =
+-        rex::thread::WaitAll(std::move(wait_handles), alertable ? true : false, timeout_ms);
++    auto result = [&] {
++#if REX_PLATFORM_ANDROID
++    rex::AndroidWaitScope wait(rex::AndroidWait::kEvent);
++#endif
++    return rex::thread::WaitAll(std::move(wait_handles), alertable ? true : false, timeout_ms);
++  }();
+     XThread::CheckTitleTermination();
+     switch (result) {
+       case rex::thread::WaitResult::kSuccess:
+diff --git a/src/system/xthread.cpp b/src/system/xthread.cpp
+index 505e012..c947ca2 100644
+--- a/src/system/xthread.cpp
++++ b/src/system/xthread.cpp
+@@ -9,6 +9,7 @@
+  * @modified    Tom Clay, 2026 - Adapted for ReXGlue runtime
+  */
+ 
++#include <rex/android_diagnostics.h>
+ #include <algorithm>
+ #include <atomic>
+ #include <cstring>
+@@ -579,6 +580,11 @@ X_STATUS XThread::Terminate(int exit_code) {
+ }
+ 
+ void XThread::Execute() {
++#if REX_PLATFORM_ANDROID
++  if (is_guest_thread() && main_thread()) {
++    rex::GetAndroidDiagnostics().guest_tid.store(rex::AndroidDiagnosticTid());
++  }
++#endif
+   REXSYS_NOISY_DEBUG("Execute thid {} (handle={:08X}, '{}', native={:08X})", thread_id_, handle(),
+                      thread_name_, thread_->system_id());
+ 
+diff --git a/src/ui/presenter.cpp b/src/ui/presenter.cpp
+index e36247a..573b83b 100644
+--- a/src/ui/presenter.cpp
++++ b/src/ui/presenter.cpp
+@@ -9,6 +9,7 @@
+  * @modified    Tom Clay, 2026 - Adapted for ReXGlue runtime
+  */
+ 
++#include <rex/android_diagnostics.h>
+ #include <algorithm>
+ #include <atomic>
+ #include <cctype>
+@@ -753,7 +754,11 @@ void Presenter::PaintFromUIThread(bool force_paint) {
+     // guaranteed to have access to have ownership of painting as it's taken
+     // here only conditionally, thus can't know whether the connection is
+     // actually in a paintable state).
+-    if (surface_paint_connection_state_ != SurfacePaintConnectionState::kConnectedPaintable) {
++    if (surface_paint_connection_state_ != SurfacePaintConnectionState::kConnectedPaintable
++#if REX_PLATFORM_ANDROID
++        && surface_paint_connection_state_ != SurfacePaintConnectionState::kConnectedOutdated
++#endif
++    ) {
+       SetPaintModeFromUIThread(PaintMode::kNone);
+     }
+   }
+@@ -765,7 +770,11 @@ void Presenter::PaintFromUIThread(bool force_paint) {
+   // state), and overall synchronize the state taking into account both what has
+   // been done in this function and what could have been done by the UI drawer
+   // callbacks.
+-  if (paint_mode_ != PaintMode::kNone) {
++  if (paint_mode_ != PaintMode::kNone
++#if REX_PLATFORM_ANDROID
++      && surface_paint_connection_state_ != SurfacePaintConnectionState::kConnectedOutdated
++#endif
++  ) {
+     SetPaintModeFromUIThread(GetDesiredPaintModeFromUIThread(true));
+   }
+   is_in_ui_thread_paint_ = false;
+@@ -828,10 +837,12 @@ void Presenter::PaintFromUIThreadInUIOverlayPaintMode(bool force_paint, bool dra
+     }
+     if (surface_paint_connection_state_ == SurfacePaintConnectionState::kConnectedOutdated) {
+       UpdateSurfacePaintConnectionFromUIThread(nullptr, false);
++#if !REX_PLATFORM_ANDROID
+       if (surface_paint_connection_state_ == SurfacePaintConnectionState::kConnectedOutdated) {
+         // Retry in the next frame, giving the window system time.
+         request_repaint_immediately = true;
+       }
++#endif
+     }
+     if (resuming &&
+         surface_paint_connection_state_ == SurfacePaintConnectionState::kConnectedPaintable) {
+@@ -859,8 +870,15 @@ void Presenter::PaintFromUIThreadInUIOverlayPaintMode(bool force_paint, bool dra
+         }
+       }
+     }
+-    SetPaintModeFromUIThread(GetDesiredPaintModeFromUIThread(
+-        surface_paint_connection_state_ == SurfacePaintConnectionState::kConnectedPaintable));
++#if REX_PLATFORM_ANDROID
++    if (surface_paint_connection_state_ == SurfacePaintConnectionState::kConnectedOutdated) {
++      SetPaintModeFromUIThread(PaintMode::kUIThreadOnRequest);
++    } else
++#endif
++    {
++      SetPaintModeFromUIThread(GetDesiredPaintModeFromUIThread(
++          surface_paint_connection_state_ == SurfacePaintConnectionState::kConnectedPaintable));
++    }
+   }
+   if (draw_overlay && paint_mode_ != PaintMode::kNone) {
+     // As fast as the UI thread would paint (the overlay isn't presented here).
+@@ -1034,6 +1052,9 @@ bool Presenter::RefreshGuestOutput(
+     uint32_t frontbuffer_width, uint32_t frontbuffer_height, uint32_t display_aspect_ratio_x,
+     uint32_t display_aspect_ratio_y,
+     std::function<bool(GuestOutputRefreshContext& context)> refresher) {
++#if REX_PLATFORM_ANDROID
++  rex::GetAndroidDiagnostics().frames.fetch_add(1, std::memory_order_relaxed);
++#endif
+   if (ui_overlay_paint_mode_) {
+     // Development: a stall of the guest output thread on request.
+     static int32_t last_stall_ms = 0;
+@@ -1924,6 +1945,10 @@ void Presenter::UpdateSurfacePaintConnectionFromUIThread(bool* repaint_needed_ou
+   // the UI thread, so no need to lock the mutex.
+   assert_true(paint_mode_ != PaintMode::kGuestOutputThreadImmediately);
+ 
++#if REX_PLATFORM_ANDROID
++  const bool recovering =
++      surface_paint_connection_state_ == SurfacePaintConnectionState::kConnectedOutdated;
++#endif
+   // Initialize repaint_needed_out for failure cases.
+   if (repaint_needed_out) {
+     *repaint_needed_out = false;
+@@ -1961,11 +1986,18 @@ void Presenter::UpdateSurfacePaintConnectionFromUIThread(bool* repaint_needed_ou
+           surface_paint_connection_has_implicit_vsync_ = is_vsync_implicit;
+           surface_width_in_paint_connection_ = surface_width;
+           surface_height_in_paint_connection_ = surface_height;
+-          if (!is_reconnect) {
++          if (!is_reconnect && repaint_needed_out) {
+             *repaint_needed_out = true;
+           }
+           break;
+         case SurfacePaintConnectResult::kFailure:
++#if REX_PLATFORM_ANDROID
++          if (recovering) {
++            // Keep the next guest frame able to request another recovery.
++            surface_paint_connection_outdated_.store(true, std::memory_order_release);
++            break;
++          }
++#endif
+           surface_paint_connection_state_ =
+               SurfacePaintConnectionState::kUnconnectedRetryAtStateChange;
+           break;
+@@ -1977,6 +2009,14 @@ void Presenter::UpdateSurfacePaintConnectionFromUIThread(bool* repaint_needed_ou
+     }
+   }
+ 
++#if REX_PLATFORM_ANDROID
++  if (recovering) {
++    auto& reason = rex::GetAndroidDiagnostics().swapchain_reason;
++    const bool ok = surface_paint_connection_state_ == SurfacePaintConnectionState::kConnectedPaintable;
++    REXLOG_INFO("[present] swapchain recreated reason={} ok={}", reason.load(), ok);
++    if (ok) reason.store("surface_outdated");
++  }
++#endif
+   // UI overlay painting: a new connection may draw the overlay again.
+   ui_overlay_render_failed_ = false;
+ 
+@@ -2097,6 +2137,7 @@ Presenter::PaintResult Presenter::PaintAndPresent(bool execute_ui_drawers) {
+     std::lock_guard<std::mutex> lock(presentation_times_mutex_);
+     if (refresh > last_presented_refresh_number_) {
+       last_presented_refresh_number_ = refresh;
++      rex::GetAndroidDiagnostics().presented.fetch_add(1, std::memory_order_relaxed);
+       presentation_times_[presentation_times_count_++ % presentation_times_.size()] = PresentLog::Now();
+     }
+   }
+diff --git a/src/ui/vulkan/vulkan_device.cpp b/src/ui/vulkan/vulkan_device.cpp
+index a80f3cd..7b7bd1a 100644
+--- a/src/ui/vulkan/vulkan_device.cpp
++++ b/src/ui/vulkan/vulkan_device.cpp
+@@ -795,7 +795,8 @@ std::unique_ptr<VulkanDevice> VulkanDevice::CreateIfSupported(
+ 
+   if (ext_1_2_KHR_driver_properties) {
+     XE_UI_VULKAN_ENUM_PROPERTY_2(properties_1_2_KHR_driver_properties, driverID, DriverId);
+-    REXLOG_INFO("* driverName: {}", properties_1_2_KHR_driver_properties.driverName);
++    REXLOG_INFO("[driver] driverName={} driverID={}", properties_1_2_KHR_driver_properties.driverName,
++                unsigned(properties_1_2_KHR_driver_properties.driverID));
+     if (properties_1_2_KHR_driver_properties.driverInfo[0]) {
+       REXLOG_INFO("* driverInfo: {}", properties_1_2_KHR_driver_properties.driverInfo);
+     }
+@@ -804,6 +805,10 @@ std::unique_ptr<VulkanDevice> VulkanDevice::CreateIfSupported(
+                 properties_1_2_KHR_driver_properties.conformanceVersion.minor,
+                 properties_1_2_KHR_driver_properties.conformanceVersion.subminor,
+                 properties_1_2_KHR_driver_properties.conformanceVersion.patch);
++  } else {
++#if REX_PLATFORM_ANDROID
++    REXLOG_INFO("[driver] driverName=unavailable driverID=unavailable reason=no_driver_properties");
++#endif
+   }
+ 
+   XE_UI_VULKAN_LIMIT(maxImageDimension2D)
+diff --git a/src/ui/vulkan/vulkan_instance.cpp b/src/ui/vulkan/vulkan_instance.cpp
+index 8827665..f96add3 100644
+--- a/src/ui/vulkan/vulkan_instance.cpp
++++ b/src/ui/vulkan/vulkan_instance.cpp
+@@ -64,29 +64,29 @@ static void* OpenSelectedAndroidDriver() {
+   // Never use arbitrary paths from app data as a library name.
+   if (driver_name != "libvulkan_freedreno.so" &&
+       driver_name != "libvulkan_panfrost.so") {
+-    REXLOG_WARN("Unknown selected Android Vulkan driver; using system Vulkan");
++    REXLOG_WARN("[driver] Unknown selected Android Vulkan driver; using system Vulkan");
+     return nullptr;
+   }
+   const std::filesystem::path driver = driver_dir / driver_name;
+   if (!std::filesystem::is_regular_file(driver)) {
+-    REXLOG_WARN("Selected Android Vulkan driver is missing; using system Vulkan");
++    REXLOG_WARN("[driver] Selected Android Vulkan driver is missing; using system Vulkan");
+     return nullptr;
+   }
+   const char* hook_path = std::getenv("MCLA_NATIVE_LIBRARY_DIR");
+   if (!hook_path || !*hook_path) {
+-    REXLOG_WARN("Cannot locate Android Vulkan hook libraries; using system Vulkan");
++    REXLOG_WARN("[driver] Cannot locate Android Vulkan hook libraries; using system Vulkan");
+     return nullptr;
+   }
+   void* tools_lib = dlopen("libadrenotools.so", RTLD_NOW | RTLD_LOCAL);
+   if (!tools_lib) {
+-    REXLOG_WARN("Cannot load AdrenoTools: {}; using system Vulkan", dlerror());
++    REXLOG_WARN("[driver] Cannot load AdrenoTools: {}; using system Vulkan", dlerror());
+     return nullptr;
+   }
+   using OpenFn = void* (*)(int, int, const char*, const char*, const char*, const char*,
+                             const char*, void**);
+   auto open = reinterpret_cast<OpenFn>(dlsym(tools_lib, "adrenotools_open_libvulkan"));
+   if (!open) {
+-    REXLOG_WARN("AdrenoTools Vulkan entry point missing; using system Vulkan");
++    REXLOG_WARN("[driver] AdrenoTools Vulkan entry point missing; using system Vulkan");
+     dlclose(tools_lib);
+     return nullptr;
+   }
+@@ -96,10 +96,10 @@ static void* OpenSelectedAndroidDriver() {
+   void* handle = open(RTLD_NOW, kCustomDriver, temp_path, hook_path,
+                       driver_path.c_str(), driver_name.c_str(), nullptr, nullptr);
+   if (handle) {
+-    REXLOG_INFO("Driver loader opened selected Vulkan library from {}; verify GPU and driver name",
++    REXLOG_INFO("[driver] Driver loader opened selected Vulkan library from {}; verify GPU and driver name",
+                 driver.string());
+   } else {
+-    REXLOG_WARN("AdrenoTools rejected selected driver; using system Vulkan");
++    REXLOG_WARN("[driver] AdrenoTools rejected selected driver; using system Vulkan");
+     dlclose(tools_lib);
+   }
+   return handle;
+diff --git a/src/ui/vulkan/vulkan_presenter.cpp b/src/ui/vulkan/vulkan_presenter.cpp
+index 6d23b11..11167b8 100644
+--- a/src/ui/vulkan/vulkan_presenter.cpp
++++ b/src/ui/vulkan/vulkan_presenter.cpp
+@@ -9,6 +9,7 @@
+  * @modified    Tom Clay, 2026 - Adapted for ReXGlue runtime
+  */
+ 
++#include <rex/android_diagnostics.h>
+ #include <algorithm>
+ #include <atomic>
+ #include <cstddef>
+@@ -2019,6 +2020,12 @@ Presenter::PaintResult VulkanPresenter::PaintAndPresentImpl(bool execute_ui_draw
+ 
+   VkSemaphore acquire_semaphore = paint_submission.acquire_semaphore();
+   uint32_t swapchain_image_index = 0;
++#if REX_PLATFORM_ANDROID
++  if (!paced) {
++    rex::GetAndroidDiagnostics().last_vk_wait.store("vkAcquireNextImageKHR",
++                                                    std::memory_order_relaxed);
++  }
++#endif
+   VkResult acquire_result =
+       paced ? VK_SUCCESS
+             : dfn.vkAcquireNextImageKHR(device, paint_context_.swapchain, UINT64_MAX,
+@@ -2028,6 +2035,21 @@ Presenter::PaintResult VulkanPresenter::PaintAndPresentImpl(bool execute_ui_draw
+     REXLOG_INFO("VulkanPresenter: paint {} acquire returned {}, image {}", ps5_paint_index,
+                 static_cast<int>(acquire_result), swapchain_image_index);
+   }
++#endif
++#if REX_PLATFORM_ANDROID
++  switch (acquire_result) {
++    case VK_SUBOPTIMAL_KHR:
++      rex::GetAndroidDiagnostics().swapchain_reason.store("VK_SUBOPTIMAL_KHR");
++      break;
++    case VK_ERROR_OUT_OF_DATE_KHR:
++      rex::GetAndroidDiagnostics().swapchain_reason.store("VK_ERROR_OUT_OF_DATE_KHR");
++      break;
++    case VK_ERROR_SURFACE_LOST_KHR:
++      rex::GetAndroidDiagnostics().swapchain_reason.store("VK_ERROR_SURFACE_LOST_KHR");
++      break;
++    default:
++      break;
++  }
+ #endif
+   switch (acquire_result) {
+     case VK_SUCCESS:
+@@ -2898,10 +2920,26 @@ Presenter::PaintResult VulkanPresenter::PaintAndPresentImpl(bool execute_ui_draw
+     REXLOG_INFO("VulkanPresenter: paint {} present returned {}", ps5_paint_index,
+                 static_cast<int>(present_result));
+   }
++#endif
++#if REX_PLATFORM_ANDROID
++  switch (present_result) {
++    case VK_SUBOPTIMAL_KHR:
++      rex::GetAndroidDiagnostics().swapchain_reason.store("VK_SUBOPTIMAL_KHR");
++      break;
++    case VK_ERROR_OUT_OF_DATE_KHR:
++      rex::GetAndroidDiagnostics().swapchain_reason.store("VK_ERROR_OUT_OF_DATE_KHR");
++      break;
++    case VK_ERROR_SURFACE_LOST_KHR:
++      rex::GetAndroidDiagnostics().swapchain_reason.store("VK_ERROR_SURFACE_LOST_KHR");
++      break;
++    default:
++      break;
++  }
+ #endif
+   switch (present_result) {
+     case VK_SUCCESS:
+-      return PaintResult::kPresented;
++      return acquire_result == VK_SUBOPTIMAL_KHR ? PaintResult::kPresentedSuboptimal
++                                                 : PaintResult::kPresented;
+     case VK_SUBOPTIMAL_KHR:
+       return PaintResult::kPresentedSuboptimal;
+     case VK_ERROR_DEVICE_LOST:
+diff --git a/src/ui/vulkan/vulkan_provider.cpp b/src/ui/vulkan/vulkan_provider.cpp
+index a7edd0e..6dab5ec 100644
+--- a/src/ui/vulkan/vulkan_provider.cpp
++++ b/src/ui/vulkan/vulkan_provider.cpp
+@@ -51,8 +51,13 @@ std::unique_ptr<VulkanProvider> VulkanProvider::Create(const bool with_gpu_emula
+   if (VulkanInstance::HasSelectedAndroidDriver()) {
+     auto provider = CreateWithInstance(VulkanInstance::Create(with_presentation, validation, true),
+                                        with_gpu_emulation, with_presentation);
+-    if (provider) return provider;
+-    REXLOG_WARN("Selected Vulkan driver failed initialization; retrying with system Vulkan");
++    if (provider) {
++      REXLOG_INFO("[driver] source=selected");
++      return provider;
++    }
++    REXLOG_WARN("[driver] source=system reason=selected_driver_initialization_failed");
++  } else {
++    REXLOG_INFO("[driver] source=system reason=no_selected_driver_file");
+   }
+ #endif
+   return CreateWithInstance(VulkanInstance::Create(with_presentation, validation), with_gpu_emulation,
+diff --git a/src/ui/window_sdl.cpp b/src/ui/window_sdl.cpp
+index 7752451..4dbf90c 100644
+--- a/src/ui/window_sdl.cpp
++++ b/src/ui/window_sdl.cpp
+@@ -483,7 +483,17 @@ void WindowSDL::RequestPaintImpl() {
+   SDL_Event event{};
+   event.type = sdl_app_context().paint_event_type();
+   event.user.windowID = sdl_window_id_;
+-  SDL_PushEvent(&event);
++  if (!SDL_PushEvent(&event)) {
++#if REX_PLATFORM_ANDROID
++    if (sdl_app_context().CallInUIThreadDeferred(
++            [id = sdl_window_id_, context = &sdl_app_context()] {
++              if (auto* window = context->GetWindow(id)) window->HandlePaintEvent();
++            })) {
++      return;
++    }
++#endif
++    paint_pending_.store(false, std::memory_order_release);
++  }
+ }
+ 
+ void WindowSDL::HandlePaintEvent() {
+diff --git a/src/ui/windowed_app_context_sdl.cpp b/src/ui/windowed_app_context_sdl.cpp
+index dc0b4c2..e4442e8 100644
+--- a/src/ui/windowed_app_context_sdl.cpp
++++ b/src/ui/windowed_app_context_sdl.cpp
+@@ -87,11 +87,17 @@ void SDLWindowedAppContext::PlatformQuitFromUIThread() {
+ int SDLWindowedAppContext::RunMainMessageLoop() {
+   while (!HasQuitFromUIThread()) {
+     SDL_Event event;
++#if REX_PLATFORM_ANDROID
++    // Deferred work still needs dispatch if SDL dropped its wake-up event.
++    if (SDL_WaitEventTimeout(&event, 100)) ProcessEvent(event);
++    ExecutePendingFunctionsFromUIThread();
++#else
+     if (!SDL_WaitEvent(&event)) {
+       REXLOG_ERROR("SDL_WaitEvent failed: {}", SDL_GetError());
+       return EXIT_FAILURE;
+     }
+     ProcessEvent(event);
++#endif
+   }
+   return EXIT_SUCCESS;
+ }
