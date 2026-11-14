@@ -49,6 +49,11 @@
 #if defined(__ANDROID__)
 #include <android/log.h>
 #include <condition_variable>
+#include <cerrno>
+#include <csignal>
+#include <dlfcn.h>
+#include <sys/syscall.h>
+#include <ucontext.h>
 #include <mutex>
 #include <sstream>
 #include <unordered_map>
@@ -65,6 +70,8 @@
 
 #ifdef __ANDROID__
 REXCVAR_DECLARE(int32_t, mcla_fps);  // Defined in frame_timing.cpp.
+REXCVAR_DEFINE_BOOL(mcla_city_diagnostics, true, "MCLA",
+                    "Sample guest worker PCs and long guest synchronization waits on Android");
 REXCVAR_DEFINE_BOOL(mcla_adreno_610_compatibility, false, "MCLA",
                     "Use the conservative Vulkan texture and render pass paths on Adreno 610");
 REXCVAR_DEFINE_BOOL(mcla_fps_overlay, true, "MCLA",
@@ -1225,7 +1232,105 @@ void MclaApp::OnGuestThreadExit(rex::system::XThread* thread) {
 }
 
 #if REX_PLATFORM_ANDROID
+extern uint32_t MclaGuestFunctionForHostPc(uintptr_t host_pc);
+
 namespace {
+std::atomic<int> hot_guest_target{0};
+std::atomic<uintptr_t> hot_guest_pc{0};
+std::atomic<int> hot_guest_requested{0};
+static_assert(std::atomic<int>::is_always_lock_free);
+static_assert(std::atomic<uintptr_t>::is_always_lock_free);
+
+void CaptureHotGuestPc(int, siginfo_t*, void* context) {
+#if defined(__aarch64__)
+  const auto* cpu = static_cast<const ucontext_t*>(context);
+  const int tid = gettid();
+  if (hot_guest_requested.load(std::memory_order_relaxed) == tid) {
+    hot_guest_pc.store(cpu->uc_mcontext.pc, std::memory_order_relaxed);
+    hot_guest_requested.store(0, std::memory_order_release);
+  }
+#endif
+}
+
+int InstallHotGuestSampler() {
+#if defined(__aarch64__)
+  const int signal = SIGRTMAX - 3;
+  struct sigaction previous {};
+  if (sigaction(signal, nullptr, &previous) != 0 || previous.sa_handler != SIG_DFL) return 0;
+  struct sigaction action {};
+  action.sa_sigaction = CaptureHotGuestPc;
+  action.sa_flags = SA_SIGINFO | SA_RESTART;
+  sigemptyset(&action.sa_mask);
+  if (sigaction(signal, &action, nullptr) == 0) return signal;
+#endif
+  return 0;
+}
+
+void SampleHotGuest(std::stop_token stop) {
+  using namespace std::chrono;
+  const int signal = InstallHotGuestSampler();
+  if (!signal) {
+    REXLOG_INFO("[hotguest] status=sampler_unavailable");
+    return;
+  }
+  Dl_info game_module{};
+  dladdr(reinterpret_cast<const void*>(&MclaGuestFunctionForHostPc), &game_module);
+  std::unordered_map<uint32_t, unsigned> histogram;
+  unsigned samples = 0;
+  int previous_target = 0;
+  auto deadline = steady_clock::now() + seconds(5);
+  while (!stop.stop_requested()) {
+    const int target = hot_guest_target.load(std::memory_order_relaxed);
+    if (target != previous_target) {
+      histogram.clear();
+      samples = 0;
+      previous_target = target;
+      hot_guest_requested.store(0, std::memory_order_relaxed);
+      hot_guest_pc.exchange(0);
+      deadline = steady_clock::now() + seconds(5);
+    }
+    if (target) {
+      const auto pc = hot_guest_pc.exchange(0);
+      if (pc) {
+        Dl_info module{};
+        const uint32_t fn = dladdr(reinterpret_cast<const void*>(pc), &module) &&
+                                    module.dli_fbase == game_module.dli_fbase
+                                ? MclaGuestFunctionForHostPc(pc)
+                                : 0;
+        ++histogram[fn];
+        ++samples;
+      }
+      if (!hot_guest_requested.load(std::memory_order_acquire)) {
+        hot_guest_requested.store(target, std::memory_order_relaxed);
+        if (syscall(SYS_tgkill, getpid(), target, signal) != 0) {
+          hot_guest_requested.store(0, std::memory_order_relaxed);
+          if (errno == ESRCH) {
+            int expired = target;
+            hot_guest_target.compare_exchange_strong(expired, 0);
+          }
+        }
+      }
+    }
+    if (steady_clock::now() >= deadline) {
+      std::vector<std::pair<uint32_t, unsigned>> top(histogram.begin(), histogram.end());
+      const auto count = std::min<size_t>(10, top.size());
+      std::partial_sort(top.begin(), top.begin() + count, top.end(),
+                        [](const auto& a, const auto& b) { return a.second > b.second; });
+      for (size_t i = 0; i < count; ++i) {
+        const auto [fn, hits] = top[i];
+        const auto name = fn ? fmt::format("sub_{:08X}", fn) : "outside_guest_code";
+        REXLOG_INFO("[hotguest] fn=0x{:08X} name={} pct={:.1f} tid={} samples={}",
+                    fn, name, 100.0 * hits / samples, target, samples);
+      }
+      histogram.clear();
+      samples = 0;
+      deadline = steady_clock::now() + seconds(5);
+    }
+    std::this_thread::sleep_for(milliseconds(10));
+  }
+  // Leave the handler installed until process exit for any previously queued signal.
+}
+
 struct AndroidThreadCpu {
   int tid;
   uint64_t ticks;
@@ -1261,6 +1366,10 @@ void SampleAndroidRuntime(std::stop_token stop) {
   const auto start = steady_clock::now();
   auto last = start;
   auto prev_threads = ReadAndroidThreadCpu();
+  std::jthread hot_guest_thread;
+  if (data.trace_guest_waits.load()) hot_guest_thread = std::jthread(SampleHotGuest);
+  uint64_t previous_updates = 0;
+  auto memory_deadline = start + seconds(5);
   const long ticks_per_sec = sysconf(_SC_CLK_TCK);
   uint64_t previous_bytes = 0, previous_reads = 0, previous_read_ns = 0;
   constexpr auto wait_count = unsigned(rex::AndroidWait::kCount);
@@ -1296,6 +1405,25 @@ void SampleAndroidRuntime(std::stop_token stop) {
     const auto count = std::min<size_t>(5, top.size());
     std::partial_sort(top.begin(), top.begin() + count, top.end(),
                       [](const auto& a, const auto& b) { return a.first > b.first; });
+    const auto guest = data.guest_tid.load();
+    const auto updates = data.guest_updates.load();
+    if (hot_guest_thread.joinable()) {
+      int hottest_worker = 0;
+      uint64_t hottest_ticks = 0;
+      const bool slow_updates = updates - previous_updates < 10;
+      const bool has_waited = data.wait_object.load() != 0;
+      if (slow_updates && has_waited && guest) {
+        for (size_t i = 0; i < top.size(); ++i) {
+          const auto& [ticks, entry] = top[i];
+          if (ticks > hottest_ticks && entry->tid != guest && entry->name.starts_with("XThread")) {
+            hottest_worker = entry->tid;
+            hottest_ticks = ticks;
+          }
+        }
+      }
+      hot_guest_target.store(hottest_worker, std::memory_order_relaxed);
+    }
+    previous_updates = updates;
     std::string cpu;
     if (ticks_per_sec > 0) {
       for (size_t i = 0; i < count; ++i) {
@@ -1334,6 +1462,26 @@ void SampleAndroidRuntime(std::stop_token stop) {
       waits += fmt::format(" {}_ms={:.3f}", wait_names[i], double(delta) / 1e6);
     }
     REXLOG_INFO("[guestwait] tid={}{}", data.guest_tid.load(), waits);
+    const auto waiting_since = data.wait_started_ns.load();
+    const auto object = data.wait_object.load();
+    const auto stamp = rex::AndroidDiagnosticNow();
+    if (waiting_since && stamp - waiting_since >= 100000000 &&
+        data.wait_started_ns.load() == waiting_since) {
+      REXLOG_INFO("[guestwait2] obj=0x{:08X} type={} waiter={} signaler=0 ms={:.3f} result=pending",
+                  uint32_t(object), unsigned(object >> 32), guest,
+                  double(stamp - waiting_since) / 1e6);
+    }
+    if (now >= memory_deadline) {
+      std::ifstream status("/proc/self/status");
+      std::string line;
+      long rss_kib = -1;
+      while (std::getline(status, line)) {
+        if (std::sscanf(line.c_str(), "VmRSS: %ld kB", &rss_kib) == 1) break;
+      }
+      REXLOG_INFO("[mem] rss_kib={} render_targets={} render_target_bytes={}", rss_kib,
+                  data.render_target_count.load(), data.render_target_bytes.load());
+      memory_deadline = now + seconds(5);
+    }
     rex::FlushLogging();
   }
 }
@@ -1342,6 +1490,7 @@ void SampleAndroidRuntime(std::stop_token stop) {
 
 void MclaApp::OnPostSetup() {
 #if REX_PLATFORM_ANDROID
+  rex::GetAndroidDiagnostics().trace_guest_waits.store(REXCVAR_GET(mcla_city_diagnostics));
   diagnostics_thread_ = std::jthread(SampleAndroidRuntime);
 #endif
   ConfigureFrameTiming();

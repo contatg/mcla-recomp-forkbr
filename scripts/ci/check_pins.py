@@ -31,6 +31,7 @@ android_patches = [
     "rexglue-android-stereo-diagnostic.patch",
     "rexglue-android-zandatsu-runtime.patch",
     "rexglue-android-runtime-diagnostics.patch",
+    "rexglue-android-city-trace.patch",
 ]
 
 build_doc = (root / "docs" / "android-build.md").read_text(encoding="utf-8", errors="replace")
@@ -75,6 +76,7 @@ known_hashes = {
     "rexglue-android-stereo-diagnostic.patch": "c624ba301ee3d504a99c04bbd558451c91f79bba303091554c5764dd091096fc",
     "rexglue-android-zandatsu-runtime.patch": "70048bbe082083dbbb94acaa0dae862633fa1af65f3d57d8c5931825cb4e02ab",
     "rexglue-android-runtime-diagnostics.patch": "33d5432c432af2fef3ed5c6bf792da842aaee0a7271de8fd51b57f68247045b7",
+    "rexglue-android-city-trace.patch": "6d18f0111fa3ede5e830bd81d80ef892d0a6c7c5f0f65db69efe82ba0f7ed880",
 }
 for name, expected in known_hashes.items():
     path = patch_dir / name

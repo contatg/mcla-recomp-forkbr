@@ -1,0 +1,271 @@
+diff --git a/include/rex/android_diagnostics.h b/include/rex/android_diagnostics.h
+index 4f02d29..d92a305 100644
+--- a/include/rex/android_diagnostics.h
++++ b/include/rex/android_diagnostics.h
+@@ -11,6 +11,10 @@ namespace rex {
+ enum class AndroidWait : unsigned { kEvent, kIo, kGpu, kWriteWatch, kCount };
+ struct AndroidDiagnostics {
+   std::atomic<int> guest_tid{0};
++  std::atomic<bool> trace_guest_waits{false};
++  std::atomic<uint64_t> wait_object{0}, wait_started_ns{0};
++  std::atomic<uint64_t> render_target_bytes{0};
++  std::atomic<unsigned> render_target_count{0};
+   std::atomic<int> pipelines_pending{0}, pipelines_preloading{0};
+   std::atomic<uint64_t> guest_updates{0};
+   std::atomic<const char*> swapchain_reason{"surface_outdated"};
+diff --git a/include/rex/system/xobject.h b/include/rex/system/xobject.h
+index 0a43f07..c32877f 100644
+--- a/include/rex/system/xobject.h
++++ b/include/rex/system/xobject.h
+@@ -150,6 +150,11 @@ class XObject {
+   rex::memory::Memory* memory() const;
+ 
+   Type type() const;
++#if REX_PLATFORM_ANDROID
++  void RecordDiagnosticSignal();
++  uint64_t diagnostic_signal() const { return diagnostic_signal_.load(); }
++  uint32_t diagnostic_handle() const { return handles_.empty() ? 0 : handles_.front(); }
++#endif
+ 
+   // Returns the primary handle of this object.
+   X_HANDLE handle() const { return handles_[0]; }
+@@ -203,6 +208,10 @@ class XObject {
+   static object_ref<T> GetNativeObject(KernelState* kernel_state, void* native_ptr,
+                                        int32_t as_type = -1);
+ 
++#if REX_PLATFORM_ANDROID
++ private:
++  std::atomic<uint64_t> diagnostic_signal_{0};
++#endif
+  protected:
+   bool SaveObject(stream::ByteStream* stream);
+   bool RestoreObject(stream::ByteStream* stream);
+diff --git a/src/graphics/pipeline/render_target/cache.cpp b/src/graphics/pipeline/render_target/cache.cpp
+index 844c9a0..9e9aac2 100644
+--- a/src/graphics/pipeline/render_target/cache.cpp
++++ b/src/graphics/pipeline/render_target/cache.cpp
+@@ -19,6 +19,7 @@
+ #include <unordered_set>
+ #include <utility>
+ 
++#include <rex/android_diagnostics.h>
+ #include <rex/assert.h>
+ #include <rex/cvar.h>
+ #include <rex/graphics/flags.h>
+@@ -449,6 +450,11 @@ void RenderTargetCache::DestroyAllRenderTargets(bool shutting_down) {
+     }
+   }
+   render_targets_.clear();
++#if REX_PLATFORM_ANDROID
++  auto& diagnostics = rex::GetAndroidDiagnostics();
++  diagnostics.render_target_count.store(unsigned(render_targets_.size()), std::memory_order_relaxed);
++  diagnostics.render_target_bytes.store(GetRenderTargetsHostMemoryBytes(), std::memory_order_relaxed);
++#endif
+ }
+ 
+ void RenderTargetCache::ShutdownCommon() {
+@@ -583,6 +589,11 @@ uint32_t RenderTargetCache::TrimUnusedRenderTargets(uint64_t* freed_bytes_out) {
+       transfers.clear();
+     }
+     OnRenderTargetsTrimmed();
++#if REX_PLATFORM_ANDROID
++    auto& diagnostics = rex::GetAndroidDiagnostics();
++    diagnostics.render_target_count.store(unsigned(render_targets_.size()), std::memory_order_relaxed);
++    diagnostics.render_target_bytes.store(GetRenderTargetsHostMemoryBytes(), std::memory_order_relaxed);
++#endif
+     REXGPU_INFO(
+         "RenderTargetCache: freed {} unused render targets ({} MB), {} left ({} MB), idle limit "
+         "{} s{}",
+@@ -2235,6 +2246,11 @@ RenderTargetCache::RenderTarget* RenderTargetCache::GetOrCreateRenderTarget(Rend
+     }
+     // Insert even if failed to create, not to try to create again.
+     render_targets_.emplace(key, render_target);
++#if REX_PLATFORM_ANDROID
++    auto& diagnostics = rex::GetAndroidDiagnostics();
++    diagnostics.render_target_count.store(unsigned(render_targets_.size()), std::memory_order_relaxed);
++    diagnostics.render_target_bytes.store(GetRenderTargetsHostMemoryBytes(), std::memory_order_relaxed);
++#endif
+   }
+   return render_target;
+ }
+diff --git a/src/graphics/vulkan/pipeline_cache.cpp b/src/graphics/vulkan/pipeline_cache.cpp
+index d5f10ed..c30a100 100644
+--- a/src/graphics/vulkan/pipeline_cache.cpp
++++ b/src/graphics/vulkan/pipeline_cache.cpp
+@@ -4171,7 +4171,7 @@ void VulkanPipelineCache::SaveVkPipelineCache() {
+     return;
+   }
+   vk_pipeline_cache_saved_size_ = pipeline_cache_data.size();
+-  REXGPU_DEBUG("Saved {} bytes of VkPipelineCache data", pipeline_cache_data.size());
++  REXGPU_INFO("[pipeline-cache] saved_bytes={}", pipeline_cache_data.size());
+ }
+ 
+ void VulkanPipelineCache::StorageWriteThread() {
+diff --git a/src/system/xevent.cpp b/src/system/xevent.cpp
+index c24fbd1..353b430 100644
+--- a/src/system/xevent.cpp
++++ b/src/system/xevent.cpp
+@@ -74,11 +74,17 @@ void XEvent::Query(uint32_t* out_type, uint32_t* out_state) {
+ }
+ 
+ int32_t XEvent::Set(uint32_t priority_increment, bool wait) {
++#if REX_PLATFORM_ANDROID
++  RecordDiagnosticSignal();
++#endif
+   event_->Set();
+   return 1;
+ }
+ 
+ int32_t XEvent::Pulse(uint32_t priority_increment, bool wait) {
++#if REX_PLATFORM_ANDROID
++  RecordDiagnosticSignal();
++#endif
+   event_->Pulse();
+   return 1;
+ }
+diff --git a/src/system/xobject.cpp b/src/system/xobject.cpp
+index facdc82..eb5970e 100644
+--- a/src/system/xobject.cpp
++++ b/src/system/xobject.cpp
+@@ -10,9 +10,11 @@
+  */
+ 
+ #include <rex/android_diagnostics.h>
++#include <array>
+ #include <vector>
+ 
+ #include <rex/chrono/clock.h>
++#include <rex/logging.h>
+ #include <rex/stream.h>
+ #include <rex/system/kernel_state.h>
+ #include <rex/system/util/string_utils.h>  // For TranslateAnsiStringAddress
+@@ -201,6 +203,62 @@ uint32_t XObject::TimeoutTicksToMs(int64_t timeout_ticks) {
+   }
+ }
+ 
++#if REX_PLATFORM_ANDROID
++void XObject::RecordDiagnosticSignal() {
++  if (!rex::GetAndroidDiagnostics().trace_guest_waits.load(std::memory_order_relaxed)) return;
++  static std::atomic<uint32_t> sequence{0};
++  diagnostic_signal_.store((uint64_t(sequence.fetch_add(1, std::memory_order_relaxed) + 1) << 32) |
++                           uint32_t(rex::AndroidDiagnosticTid()));
++}
++
++namespace {
++class GuestObjectWaitTrace {
++ public:
++  GuestObjectWaitTrace(XObject* const* objects, size_t count) {
++    auto& data = rex::GetAndroidDiagnostics();
++    if (!count || !data.trace_guest_waits.load(std::memory_order_relaxed) ||
++        rex::AndroidDiagnosticTid() != data.guest_tid.load(std::memory_order_relaxed)) return;
++    objects_ = objects;
++    count_ = std::min(count, signals_.size());
++    for (size_t i = 0; i < count_; ++i) signals_[i] = objects[i]->diagnostic_signal();
++    const auto& first = *objects[0];
++    data.wait_object.store((uint64_t(first.type()) << 32) | Address(first));
++    started_ = rex::AndroidDiagnosticNow();
++    data.wait_started_ns.store(started_);
++  }
++
++  void Finish(rex::thread::WaitResult result, size_t index = 0, bool all = false) {
++    if (!started_) return;
++    const auto duration = rex::AndroidDiagnosticNow() - started_;
++    rex::GetAndroidDiagnostics().wait_started_ns.store(0);
++    if (duration < 100000000) return;
++    const bool success = result == rex::thread::WaitResult::kSuccess;
++    if (success && !all && index >= count_) return;
++    const size_t end = success && !all ? index + 1 : count_;
++    for (size_t i = success && !all ? index : 0; i < end; ++i) {
++      const auto& object = *objects_[i];
++      const auto signal = object.diagnostic_signal();
++      const auto signaler = success && signals_[i] != signal ? uint32_t(signal) : 0;
++      REXLOG_INFO("[guestwait2] obj=0x{:08X} type={} waiter={} signaler={} ms={:.3f} "
++                  "result={} index={}/{} address_kind={}",
++                  Address(object), unsigned(object.type()), rex::AndroidDiagnosticTid(), signaler,
++                  double(duration) / 1e6, unsigned(result), i, count_,
++                  object.guest_object() ? "guest" : "handle");
++    }
++  }
++
++ private:
++  static uint32_t Address(const XObject& object) {
++    return object.guest_object() ? object.guest_object() : object.diagnostic_handle();
++  }
++  XObject* const* objects_ = nullptr;
++  std::array<uint64_t, 64> signals_;
++  size_t count_ = 0;
++  uint64_t started_ = 0;
++};
++}  // namespace
++#endif
++
+ X_STATUS XObject::Wait(uint32_t wait_reason, uint32_t processor_mode, uint32_t alertable,
+                        uint64_t* opt_timeout) {
+   auto wait_handle = GetWaitHandle();
+@@ -214,12 +272,19 @@ X_STATUS XObject::Wait(uint32_t wait_reason, uint32_t processor_mode, uint32_t a
+                                 : std::chrono::milliseconds::max();
+ 
+   XThread::CheckTitleTermination();
++#if REX_PLATFORM_ANDROID
++  XObject* object = this;
++  GuestObjectWaitTrace trace(&object, 1);
++#endif
+   auto result = [&] {
+ #if REX_PLATFORM_ANDROID
+     rex::AndroidWaitScope wait(rex::AndroidWait::kEvent);
+ #endif
+     return rex::thread::Wait(wait_handle, alertable ? true : false, timeout_ms);
+   }();
++#if REX_PLATFORM_ANDROID
++  trace.Finish(result);
++#endif
+   XThread::CheckTitleTermination();
+   switch (result) {
+     case rex::thread::WaitResult::kSuccess:
+@@ -245,9 +310,16 @@ X_STATUS XObject::SignalAndWait(XObject* signal_object, XObject* wait_object, ui
+                                       TimeoutTicksToMs(*opt_timeout)))
+                                 : std::chrono::milliseconds::max();
+ 
++#if REX_PLATFORM_ANDROID
++  GuestObjectWaitTrace trace(&wait_object, 1);
++  signal_object->RecordDiagnosticSignal();
++#endif
+   auto result =
+       rex::thread::SignalAndWait(signal_object->GetWaitHandle(), wait_object->GetWaitHandle(),
+                                  alertable ? true : false, timeout_ms);
++#if REX_PLATFORM_ANDROID
++  trace.Finish(result);
++#endif
+   switch (result) {
+     case rex::thread::WaitResult::kSuccess:
+       wait_object->WaitCallback();
+@@ -279,6 +351,9 @@ X_STATUS XObject::WaitMultiple(uint32_t count, XObject** objects, uint32_t wait_
+                                 : std::chrono::milliseconds::max();
+ 
+   XThread::CheckTitleTermination();
++#if REX_PLATFORM_ANDROID
++  GuestObjectWaitTrace trace(objects, count);
++#endif
+   if (wait_type) {
+     auto result = [&] {
+ #if REX_PLATFORM_ANDROID
+@@ -286,6 +361,9 @@ X_STATUS XObject::WaitMultiple(uint32_t count, XObject** objects, uint32_t wait_
+ #endif
+     return rex::thread::WaitAny(std::move(wait_handles), alertable ? true : false, timeout_ms);
+   }();
++#if REX_PLATFORM_ANDROID
++    trace.Finish(result.first, result.second);
++#endif
+     XThread::CheckTitleTermination();
+     switch (result.first) {
+       case rex::thread::WaitResult::kSuccess:
+@@ -311,6 +389,9 @@ X_STATUS XObject::WaitMultiple(uint32_t count, XObject** objects, uint32_t wait_
+ #endif
+     return rex::thread::WaitAll(std::move(wait_handles), alertable ? true : false, timeout_ms);
+   }();
++#if REX_PLATFORM_ANDROID
++    trace.Finish(result, 0, true);
++#endif
+     XThread::CheckTitleTermination();
+     switch (result) {
+       case rex::thread::WaitResult::kSuccess:

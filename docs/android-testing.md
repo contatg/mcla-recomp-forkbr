@@ -315,3 +315,51 @@ No build is performed by this documentation page. The source recipe is in
 [android-build.md](android-build.md), and CI builds the patched SDK and host
 stub without game data. The APK includes AdrenoTools and its hooks, but no
 third-party Turnip driver.
+
+## v0.1.52 — transição para a cidade
+
+A hipótese desta versão é que a espera da thread principal acompanha o
+trabalho de outra thread do guest. A v0.1.51 registrou cerca de uma
+atualização por segundo durante a transição e leituras de 4.112.573 e
+4.562.237 bytes do cache Vulkan em duas sessões Normal. A imagem verde
+ainda precisa de diagnóstico do draw.
+
+- `mcla_city_diagnostics=false` desativa a amostragem de PC e o rastreio
+  detalhado de esperas no `mcla.toml`. Os logs da v0.1.51 continuam ativos.
+- `[hotguest]`: amostra o PC ARM64 da XThread de trabalho com maior
+  consumo de CPU no último segundo parado. O endereço `sub_*` é a
+  função PPC mapeada pela tabela de crash. `outside_guest_code` é uma
+  amostra fora do mapeamento. Não classifique função desconhecida pela
+  porcentagem de amostras.
+- `[guestwait2]`: registra esperas de pelo menos 100 ms. `address_kind`
+  informa se o valor é endereço guest ou handle. O tipo 2 é evento,
+  6 é mutex, 8 é semáforo, 12 é thread e 13 é timer. `signaler=0`
+  indica ausência de um sinal atribuível no intervalo. Um TID registrado
+  é o último sinal instrumentado durante a espera. Em espera múltipla
+  pendente, a linha periódica mostra o primeiro objeto do grupo.
+- `[mem]`: RSS do processo e alocações de render targets a cada 5 s.
+  A contagem cobre o cache residente de alvos.
+- `[pipeline-cache] saved_bytes=`: registra a gravação bem-sucedida
+  do cache. A linha `Loaded ... bytes of VkPipelineCache data` continua
+  indicando o carregamento. Já existe gravação em background após drenar
+  a fila (2 s sem novas criações e intervalo mínimo de 10 s) e no
+  encerramento normal se houver alterações.
+
+| Opção no SD680 | Normal | Performance |
+| --- | --- | --- |
+| TU_DEBUG automático para Turnip | `syncdraw` | Sem override |
+| Anti-alias, blur e sombras | Configuração padrão do jogo/preset | Desligados, com caminho rápido de sombra de carro |
+| LOD cidade / tráfego | Configuração padrão do jogo/preset | 0,75 / 0,5 |
+| Distância de tráfego / pedestres / carros estacionados | Configuração padrão do jogo/preset | 250 / 0,5 / 0,5 |
+| Anisotropia | Configuração padrão do jogo/preset | 2 |
+| Espera de pipeline em occlusion query | 500 ms por padrão | 8 ms por padrão |
+| Janela de espera ativa por quadro | 1.500 µs por padrão | 300 µs por padrão |
+| Compiladores Vulkan | 2 | 2 |
+| Dynamic rendering / upload direto / pausa em frames incompletos | Desligados na compatibilidade Adreno 610 | Desligados na compatibilidade Adreno 610 |
+| Hook de fence em `render_perf.cpp` | Mesma configuração | Mesma configuração |
+
+Teste cada perfil por até 90 s na cidade ou até entrar em uma corrida.
+Exporte em **Extras → Exportar diagnóstico** logo depois de cada teste,
+salve as duas cópias com nomes diferentes e informe se houve imagem verde,
+áudio e corrida. Inclua as linhas `[stage]`, `[hotguest]` e
+`[guestwait2]` desde a transição.
