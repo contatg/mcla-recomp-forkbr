@@ -22,8 +22,8 @@ constexpr VkExtent2D kPatternExtent{960, 540};
 
 class PatternRenderer {
  public:
-  explicit PatternRenderer(VulkanPresenter& presenter)
-      : presenter_(presenter), gpu_(*presenter.vulkan_device()), vk_(gpu_.functions()) {}
+  PatternRenderer(VulkanPresenter& presenter, const rex::ui::vulkan::VulkanDevice& gpu)
+      : presenter_(presenter), gpu_(gpu), vk_(gpu_.functions()) {}
 
   ~PatternRenderer() {
     if (command_pool_) vk_.vkDestroyCommandPool(gpu_.device(), command_pool_, nullptr);
@@ -351,7 +351,14 @@ class RenderV2 final : public rex::system::IGraphicsSystem {
  private:
   void PresentPattern(std::stop_token stop) {
     using namespace std::chrono;
-    PatternRenderer renderer(*presenter_);
+    const auto* device = provider_->vulkan_device();
+    if (!device || presenter_->vulkan_device() != device) {
+      REXLOG_ERROR("[present] backend=render-v2 phase=F1 device_binding=failed");
+      rex::FlushLogging();
+      return;
+    }
+    REXLOG_INFO("[present] backend=render-v2 phase=F1 device_binding=ok");
+    PatternRenderer renderer(*presenter_, *device);
     if (!renderer.Initialize()) {
       REXLOG_ERROR("[present] backend=render-v2 pattern_init=failed");
       return;

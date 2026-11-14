@@ -103,6 +103,9 @@ if(ANDROID)
     rexglue_setup_target(mcla GPU_PLUGINS xenos)
     add_library(rexgpu-render-v2 SHARED src/render_v2/plugin.cpp)
     target_link_libraries(rexgpu-render-v2 PRIVATE rex::runtime rex::renderdoc Vulkan::Headers)
+    # The pinned Android SDK enables these presenter filters in rexui. This
+    # define changes the layout of the public Presenter and VulkanPresenter.
+    target_compile_definitions(rexgpu-render-v2 PRIVATE REX_HAS_FIDELITYFX_SDK=1)
     set_target_properties(rexgpu-render-v2 PROPERTIES POSITION_INDEPENDENT_CODE ON)
     add_dependencies(mcla rexgpu-render-v2)
 else()
