@@ -27,7 +27,7 @@ final class MclaPerformanceProfile {
         }
         int choice = selected(context);
         if (choice != 0) return VALUES[choice];
-        return isSnapdragon680() ? "performance" : "standard";
+        return "standard";
     }
 
     static boolean isSnapdragon680() {

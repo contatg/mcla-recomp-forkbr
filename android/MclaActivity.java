@@ -27,6 +27,37 @@ import java.io.FileReader;
 public final class MclaActivity extends SDLActivity {
     private static final String TAG = "MCLA";
     private MclaTouchControls touchControls;
+    private android.widget.TextView fpsLabel;
+    private final Runnable updateFps = new Runnable() {
+        @Override public void run() {
+            refreshFpsLabel();
+            logHandler.postDelayed(this, 2000);
+        }
+    };
+
+    private void refreshFpsLabel() {
+        if (fpsLabel == null) return;
+        File log = new File(getFilesDir(), "logs/mcla.log");
+        String label = "FPS: medindo…";
+        try (java.io.RandomAccessFile input = new java.io.RandomAccessFile(log, "r")) {
+            long length = input.length();
+            byte[] tail = new byte[(int) Math.min(length, 64 * 1024)];
+            input.seek(length - tail.length);
+            input.readFully(tail);
+            String report = new String(tail, java.nio.charset.StandardCharsets.UTF_8);
+            String prefix = "host presentation (recent 2s): ";
+            int start = report.lastIndexOf(prefix);
+            if (start >= 0) {
+                int end = report.indexOf(" FPS,", start);
+                if (end >= 0 && end - start < 48) {
+                    label = "FPS: " + report.substring(start + prefix.length(), end);
+                }
+            }
+        } catch (java.io.IOException ignored) {
+            // Native logging starts after the activity is created.
+        }
+        fpsLabel.setText(label);
+    }
     private InputManager inputManager;
     private AudioManager audioManager;
     private AudioFocusRequest audioFocusRequest;
@@ -105,6 +136,14 @@ public final class MclaActivity extends SDLActivity {
                     RelativeLayout.LayoutParams.MATCH_PARENT,
                     RelativeLayout.LayoutParams.MATCH_PARENT));
             touchControls.bringToFront();
+            fpsLabel = new android.widget.TextView(this);
+            fpsLabel.setTextColor(android.graphics.Color.WHITE);
+            fpsLabel.setBackgroundColor(0x99000000);
+            fpsLabel.setPadding(12, 6, 12, 6);
+            RelativeLayout.LayoutParams fpsPosition = new RelativeLayout.LayoutParams(-2, -2);
+            fpsPosition.addRule(RelativeLayout.ALIGN_PARENT_TOP);
+            fpsPosition.addRule(RelativeLayout.CENTER_HORIZONTAL);
+            mLayout.addView(fpsLabel, fpsPosition);
             inputManager = (InputManager) getSystemService(Context.INPUT_SERVICE);
             if (inputManager != null) inputManager.registerInputDeviceListener(gamepadListener, logHandler);
             updateGamepad();
@@ -280,6 +319,8 @@ public final class MclaActivity extends SDLActivity {
     @Override
     protected void onResume() {
         super.onResume();
+        logHandler.removeCallbacks(updateFps);
+        logHandler.post(updateFps);
         requestAudioFocus();
         updateGamepad();
         if (touchControls != null) touchControls.resumeControls();
@@ -289,6 +330,7 @@ public final class MclaActivity extends SDLActivity {
 
     @Override
     protected void onPause() {
+        logHandler.removeCallbacks(updateFps);
         logHandler.removeCallbacks(exportLogs);
         if (touchControls != null) touchControls.clearInput();
         abandonAudioFocus();
@@ -298,6 +340,7 @@ public final class MclaActivity extends SDLActivity {
 
     @Override
     protected void onDestroy() {
+        logHandler.removeCallbacks(updateFps);
         logHandler.removeCallbacks(exportLogs);
         if (inputManager != null) inputManager.unregisterInputDeviceListener(gamepadListener);
         if (touchControls != null) touchControls.clearInput();
